@@ -1,0 +1,16 @@
+# ~/.config/alecaframe-linux/profile.conf  (install.sh writes this for you)
+WINEPREFIX="$HOME/Games/AlecaFrame-Warframe/pfx"     # Proton prefix holding Overwolf + AlecaFrame
+GAME_DIR="$HOME/Games/AlecaFrame-Warframe/Downloaded" # contains Public/ (Warframe's DownloadDir)
+GAMEID="umu-warframe"
+STORE="none"
+PROTONPATH="UMU-Proton-10.0-4-netfix"                 # UMU-Proton 10.0-4 + patched ntdll.dll
+# LAUNCHER_EXE=""                                     # auto: AppData copy once the launcher moved itself there
+OOPO_MODE="on"                                        # on = live data on DXVK
+NEUTER_REMOTE_DISABLE="0"                             # 1 = override Overwolf's remote overlay-disable list locally
+OVERLAY_KILL_WHEN_LOADED="1"                          # kill ow-overlay.exe once the scanner is attached (input-grab fix)
+REATTACH_AFTER="75"                                   # seconds of game time without scanner before auto re-attach
+# Experimental: run against Steam's own Warframe instead (launch option STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%)
+# INJECT_MODE="steam"
+# STEAM_APPID="230410"
+# WINEPREFIX="<steam library>/steamapps/compatdata/230410/pfx"
+# SLR_LAUNCH_CLIENT="<steam library>/steamapps/common/SteamLinuxRuntime_sniper/pressure-vessel/bin/steam-runtime-launch-client"

@@ -1,0 +1,617 @@
+#!/bin/bash
+# alecaframe - run Overwolf + AlecaFrame alongside Warframe on Linux (umu-launcher + Proton).
+#
+# Part of alecaframe-linux: https://github.com/LordTalis/alecaframe-linux  (MIT)
+# Approach and Overwolf-config findings from Deftera186's guide (gist b589b9147694484e772ab7e164402d20); see CREDITS.md.
+#
+# Order of operations (matters!):
+#   1. alecaframe warframe   -> starts the Warframe LAUNCHER (not the game) and prepares AlecaFrame
+#   2. wait for "READY"       (or: alecaframe status)
+#   3. press Play in the launcher, log in in-game
+#   4. alecaframe check-data -> confirms Overwolf's data scanner attached to the game
+#
+# Commands: warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules
+
+set -u
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux"
+CONF="${ALECA_CONF:-$CONF_DIR/profile.conf}"
+
+# ---- profile defaults (install.sh writes the real values into $CONF) ----
+WINEPREFIX=""                  # the Proton prefix that holds Overwolf + AlecaFrame
+GAME_DIR=""                    # directory that contains Public/ (Warframe's DownloadDir)
+LAUNCHER_EXE=""                # auto-resolved when empty (see resolve_launcher)
+GAMEID="umu-warframe"
+STORE="none"
+PROTONPATH="UMU-Proton-10.0-4-netfix"
+AF_EXTID="afmcagbpgggkpdkokjhjkllpegnadmkignlonpjm"
+OOPO_MODE="on"                 # on = live data on DXVK (overlay injects, renderer detected); off = stale data
+NEUTER_REMOTE_DISABLE="0"      # 1 = rewrite Overwolf's overlay_disabled_games.json entry for Warframe (normally unnecessary)
+OVERLAY_KILL_WHEN_LOADED="1"   # once the scanner has attached, kill Overwolf's overlay process (it can freeze game input)
+REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf
+INJECT_MODE="umu"              # umu = re-enter the umu-run container; steam = Valve launcher service (experimental)
+STEAM_APPID="230410"
+SLR_LAUNCH_CLIENT=""
+LOGDIR="$CONF_DIR/logs"
+# --------------------------------------------------------------------------
+[ -f "$CONF" ] && . "$CONF"
+mkdir -p "$LOGDIR"
+
+PFX_USER="$WINEPREFIX/drive_c/users/steamuser"
+OW_DIR="$WINEPREFIX/drive_c/Program Files (x86)/Overwolf"
+OW_LAUNCHER="$OW_DIR/OverwolfLauncher.exe"
+OW_APPDATA="$PFX_USER/AppData/Local/Overwolf"
+AF_BGLOG="$OW_APPDATA/Log/Apps/AlecaFrame/BackGround.html.log"
+GEP_LOG="$OW_APPDATA/Log/Apps/Overwolf General GameEvents Provider/index.html.log"
+LOG="$LOGDIR/overwolf-launch.log"
+REAPER_PIDFILE="$LOGDIR/overlay-reaper.pid"
+WF_GAMEID=89541
+WF_CLASSID=8954
+AF_DATA_CDN="https://cdn.alecaframe.com/warframeData"
+
+# Common umu knobs; MUST be identical for the launcher and the injection or umu won't re-enter the container.
+# PROTON_USE_XALIA=0: Proton's accessibility helper is a Mono app and errors once real .NET 4.8 is in the prefix.
+# UMU_CONTAINER_NSENTER=1 on EVERY launch: umu only starts the container's launcher service (the endpoint 'prepare'
+#   re-enters through) when this is set on the first launch too. A first launch logs "Failed to find bus name"
+#   five times (5 s) and then starts normally; harmless.
+UMU_ENV=(WINEPREFIX="$WINEPREFIX" GAMEID="$GAMEID" STORE="$STORE" PROTONPATH="$PROTONPATH" SteamDeck=0 PROTON_USE_XALIA=0 UMU_CONTAINER_NSENTER=1)
+
+need_profile() {
+    if [ -z "$WINEPREFIX" ] || [ -z "$GAME_DIR" ]; then
+        echo "No profile. Run install.sh, or create $CONF with WINEPREFIX and GAME_DIR." >&2; exit 2
+    fi
+}
+resolve_launcher() {
+    # On its first run the standalone launcher moves itself from <GAME_DIR>/Public/Tools into the prefix's AppData
+    # (registry LauncherExe). Prefer that copy once it exists.
+    [ -n "$LAUNCHER_EXE" ] && { printf '%s\n' "$LAUNCHER_EXE"; return; }
+    local a="$PFX_USER/AppData/Local/Warframe/Downloaded/Public/Tools/Launcher.exe"
+    [ -f "$a" ] && { printf '%s\n' "$a"; return; }
+    printf '%s\n' "$GAME_DIR/Public/Tools/Launcher.exe"
+}
+
+# ---------- detection helpers (ps + comm, never pgrep -f: patterns must not match our own command line) ----------
+launcher_container_up() {
+    if [ "$INJECT_MODE" = "steam" ]; then
+        ps -eo args 2>/dev/null | grep -E 'Launcher\.exe.*-registry:Steam' | grep -qv grep
+    else
+        ps -eo args 2>/dev/null | grep -E 'umu-run.*Launcher\.exe' | grep -qv grep
+    fi
+}
+game_running()     { ps -eo comm 2>/dev/null | grep -q '^Warframe.x64'; }
+overwolf_running() { ps -eo comm 2>/dev/null | grep -q -i '^OverwolfBrowser'; }
+game_age() {   # seconds since Warframe.x64.exe started (0 if not running)
+    local p; p=$(ps -eo pid,comm | awk '$2 ~ /^Warframe.x64/ {print $1; exit}'); [ -n "$p" ] || { echo 0; return; }
+    ps -o etimes= -p "$p" 2>/dev/null | tr -d ' '
+}
+
+# ---------- GamesList OOPO (loads Overwolf's data scanner under DXVK) ----------
+gameslist_files() {
+    for d in "$OW_APPDATA" "$OW_DIR"/*/Resources; do
+        [ -d "$d" ] || continue
+        for f in "$d"/GamesList*.xml; do [ -f "$f" ] && printf '%s\n' "$f"; done
+    done
+}
+oopo_present_in() {
+    awk '/<GameInfo>/ { blk=""; isWF=0 } { blk=blk $0 ORS } /<ID>'"$WF_GAMEID"'<\/ID>/ { isWF=1 }
+         /<\/GameInfo>/ { if (isWF && blk ~ /<OOPO>True<\/OOPO>/) found=1 } END { exit(found?0:1) }' "$1" 2>/dev/null
+}
+add_oopo() {
+    local GL="$1"
+    cp -f "$GL" "$GL.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    awk '/<GameInfo>/ { isWF=0 } /<ID>'"$WF_GAMEID"'<\/ID>/ { isWF=1 }
+         (isWF && /<\/GameInfo>/ && !done) { print "    <OOPO>True</OOPO>"; done=1; isWF=0 } { print }' "$GL" > "$GL.tmp" && mv "$GL.tmp" "$GL"
+}
+remove_oopo() {
+    local GL="$1"
+    cp -f "$GL" "$GL.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+    awk '/<GameInfo>/ { isWF=0 } /<ID>'"$WF_GAMEID"'<\/ID>/ { isWF=1 } /<\/GameInfo>/ { isWF=0 }
+         (isWF && /<OOPO>.*<\/OOPO>/) { next } { print }' "$GL" > "$GL.tmp" && mv "$GL.tmp" "$GL"
+}
+apply_oopo_mode() {
+    gameslist_files | while IFS= read -r GL; do
+        if [ "$OOPO_MODE" = "on" ]; then
+            oopo_present_in "$GL" && continue
+            add_oopo "$GL" && oopo_present_in "$GL" && echo "  (set <OOPO>True</OOPO> for Warframe in $(basename "$GL"))"
+        else
+            oopo_present_in "$GL" || continue
+            remove_oopo "$GL" && echo "  (removed <OOPO> for Warframe from $(basename "$GL"))"
+        fi
+    done
+}
+
+# ---------- per-game overlay ON (required: the first overlay frame is what detects the renderer -> loads the scanner) ----------
+OW_GAME_SETTINGS_DB="$OW_APPDATA/Settings/game_settings.db"
+ensure_overlay_on() {
+    [ -d "$OW_GAME_SETTINGS_DB" ] || return 0
+    overwolf_running && return 0     # never edit a live LevelDB
+    python3 - "$OW_GAME_SETTINGS_DB" "$WF_CLASSID" <<'PYEOF'
+"""Enable Overwolf's per-game overlay for one game class in Settings/game_settings.db.
+
+game_settings.db is a LevelDB directory. Instead of shipping a LevelDB library this appends a single
+write-batch record to the current .log file; LevelDB replays the log when Overwolf next opens the database
+and the record with the highest sequence number wins. Format reference: leveldb/doc/log_format.md and
+db/write_batch.cc in google/leveldb. Only run this while Overwolf is not running.
+Exit codes: 0 = record appended, 1 = overlay already enabled, 2 = setting not found / unexpected layout.
+"""
+import datetime, glob, os, re, shutil, struct, sys
+
+BLOCK_SIZE = 32 * 1024
+HEADER_SIZE = 7                        # crc32c (4) + payload length (2) + fragment kind (1)
+FULL, FIRST, MIDDLE, LAST = 1, 2, 3, 4  # fragment kinds
+PUT = 1                                # write-batch entry kind for an insert/update
+
+def _build_crc_table(poly=0x82F63B78):
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ poly if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+CRC_TABLE = _build_crc_table()
+
+def crc32c(buf):
+    crc = 0xFFFFFFFF
+    for b in buf:
+        crc = CRC_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+def masked_crc(buf):
+    """LevelDB stores the checksum rotated right by 15 bits plus a constant (util/crc32c.h, Mask())."""
+    crc = crc32c(buf)
+    return (((crc >> 15) | (crc << 17)) + 0xA282EAD8) & 0xFFFFFFFF
+
+def put_varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+def get_varint(buf, pos):
+    result = shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if b < 0x80:
+            return result, pos
+        shift += 7
+
+def log_records(blob):
+    """Yield the payload of each complete logical record in a LevelDB log file."""
+    pos, pending = 0, bytearray()
+    while pos + HEADER_SIZE <= len(blob):
+        room = BLOCK_SIZE - pos % BLOCK_SIZE
+        if room < HEADER_SIZE:                      # block trailer: nothing fits, move to the next block
+            pos += room
+            continue
+        _crc, length, kind = struct.unpack_from('<IHB', blob, pos)
+        pos += HEADER_SIZE
+        if length == 0 and kind == 0:               # zero padding: skip the rest of the block
+            if pos % BLOCK_SIZE:
+                pos += BLOCK_SIZE - pos % BLOCK_SIZE
+            continue
+        fragment = blob[pos:pos + length]
+        pos += length
+        if kind == FULL:
+            yield bytes(fragment)
+        elif kind == FIRST:
+            pending = bytearray(fragment)
+        elif kind == MIDDLE:
+            pending += fragment
+        elif kind == LAST:
+            pending += fragment
+            yield bytes(pending)
+            pending = bytearray()
+
+def decode_batch(payload):
+    """Return (sequence, count, [(key, value or None), ...]) for one write-batch payload."""
+    sequence, count = struct.unpack_from('<QI', payload, 0)
+    pos, entries = 12, []
+    for _ in range(count):
+        kind = payload[pos]
+        pos += 1
+        klen, pos = get_varint(payload, pos)
+        key = payload[pos:pos + klen]
+        pos += klen
+        value = None
+        if kind == PUT:
+            vlen, pos = get_varint(payload, pos)
+            value = payload[pos:pos + vlen]
+            pos += vlen
+        entries.append((key, value))
+    return sequence, count, entries
+
+def encode_put_batch(sequence, key, value):
+    return (struct.pack('<QI', sequence, 1) + bytes([PUT])
+            + put_varint(len(key)) + key + put_varint(len(value)) + value)
+
+def frame_record(payload, file_size):
+    """Split one logical record into physical fragments for a log file that is currently file_size long."""
+    out, rest, first = bytearray(), memoryview(payload), True
+    while True:
+        room = BLOCK_SIZE - (file_size + len(out)) % BLOCK_SIZE
+        if room < HEADER_SIZE:                      # pad the block trailer with zeros
+            out += b'\0' * room
+            continue
+        piece = bytes(rest[:room - HEADER_SIZE])
+        rest = rest[len(piece):]
+        done = len(rest) == 0
+        kind = FULL if first and done else FIRST if first else LAST if done else MIDDLE
+        out += struct.pack('<IHB', masked_crc(bytes([kind]) + piece), len(piece), kind) + piece
+        first = False
+        if done:
+            return bytes(out)
+
+def main(db_dir, class_id):
+    logs = glob.glob(os.path.join(db_dir, '*.log'))
+    if len(logs) != 1:
+        return 2
+    log_path = logs[0]
+    with open(log_path, 'rb') as fh:
+        blob = fh.read()
+    last_sequence, found = 0, None
+    for payload in log_records(blob):
+        try:
+            sequence, count, entries = decode_batch(payload)
+        except (struct.error, IndexError):
+            continue
+        if count:
+            last_sequence = max(last_sequence, sequence + count - 1)
+        for key, value in entries:
+            if value is not None and class_id in key and b'overlayDisabled' in value:
+                found = (key, value)
+    if found is None:
+        return 2
+    key, value = found
+    text = value.decode('latin-1').rstrip()
+    if '"overlayDisabled":false' in text and '"overlayDisabledModifiedByUser":true' in text:
+        return 1
+    text = re.sub(r'"overlayDisabled":(?:true|false)', '"overlayDisabled":false', text)
+    text = re.sub(r'"overlayDisabledModifiedByUser":(?:true|false)', '"overlayDisabledModifiedByUser":true', text)
+    shutil.copytree(db_dir, '%s.bak.%s' % (db_dir, datetime.datetime.now().strftime('%Y%m%d-%H%M%S')))
+    record = frame_record(encode_put_batch(last_sequence + 1, bytes(key), text.encode('latin-1')), len(blob))
+    with open(log_path, 'ab') as fh:
+        fh.write(record)
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1], sys.argv[2].encode()))
+PYEOF
+    case $? in
+        0) echo "  (enabled the Overwolf overlay for Warframe - required for live data)";;
+        2) echo "  (overlay setting for Warframe not present yet; toggle it ON once in Overwolf settings if data stays stale)";;
+    esac
+}
+
+# ---------- remote overlay-disable list: report only (opt-in rewrite) ----------
+check_overlay_not_remotely_disabled() {
+    local DGJ="$OW_APPDATA/PackagesCache/overlay_disabled_games.json"
+    [ -f "$DGJ" ] || return 0
+    python3 - "$DGJ" "$WF_GAMEID" "$NEUTER_REMOTE_DISABLE" <<'PYEOF'
+"""Report (or, with NEUTER_REMOTE_DISABLE=1, override) Overwolf's remote overlay-disable list for Warframe."""
+import json, sys
+path, game_id, override = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    entries = [e for e in doc.get("games", []) if isinstance(e, dict) and e.get("id") == game_id]
+except (OSError, ValueError, AttributeError):
+    sys.exit(0)
+if not entries:
+    sys.exit(0)
+if override:
+    for entry in entries:
+        entry["minVersion"] = "999.0.0.0"          # a version Overwolf will never reach: the entry never applies
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    print("  (NEUTER_REMOTE_DISABLE=1: rewrote Overwolf's remote overlay-disable entry for Warframe)")
+else:
+    print("  WARNING: Overwolf's remote list currently disables the Warframe overlay: %s" % entries)
+    print("           Live data will not work until Overwolf lifts it. (NEUTER_REMOTE_DISABLE=1 overrides it locally.)")
+PYEOF
+}
+
+# ---------- AlecaFrame manifest: clickable MainWindow under XWayland + remembered position ----------
+ensure_manifest_patches() {
+    local EXTROOT="$OW_APPDATA/Extensions/$AF_EXTID"
+    [ -d "$EXTROOT" ] || return 0
+    for MF in "$EXTROOT"/*/manifest.json; do
+        [ -f "$MF" ] || continue
+        python3 - "$MF" <<'PYEOF'
+"""Make AlecaFrame's main window a normal, clickable window that keeps its position (Overwolf manifest.json)."""
+import datetime, json, os, shutil, sys
+path = sys.argv[1]
+WANTED = {"native_window": False, "keep_window_location": True}
+try:
+    with open(path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    window = manifest["data"]["windows"]["MainWindow"]
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(2)
+if not isinstance(window, dict):
+    sys.exit(2)
+if all(window.get(k) is v for k, v in WANTED.items()):
+    sys.exit(1)
+shutil.copyfile(path, "%s.bak.%s" % (path, datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
+window.update(WANTED)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(manifest, fh, indent=2)
+os.replace(tmp, path)
+sys.exit(0)
+PYEOF
+        [ $? -eq 0 ] && echo "  (patched AlecaFrame MainWindow manifest: clickable under XWayland, keeps its position)"
+    done
+}
+
+# ---------- AlecaFrame data cache (a missing json.7z hangs its init under Wine TLS) ----------
+ensure_data_cache() {
+    local CD="$PFX_USER/AppData/Local/AlecaFrame/cachedData" want cur rmd5 tmp got
+    mkdir -p "$CD"
+    want=""; [ -f "$CD/receivedMD5.txt" ] && want=$(awk '{print $1; exit}' "$CD/receivedMD5.txt" 2>/dev/null)
+    cur="";  [ -f "$CD/json.7z" ] && cur=$(md5sum "$CD/json.7z" | awk '{print $1}')
+    [ -n "$cur" ] && [ -n "$want" ] && [ "$cur" = "$want" ] && return 0
+    rmd5=$(curl -fsSL "$AF_DATA_CDN/json7z.md5" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$rmd5" ] || return 0
+    if [ -n "$cur" ] && [ "$cur" = "$rmd5" ]; then printf '%s  json.7z\n' "$rmd5" > "$CD/receivedMD5.txt"; return 0; fi
+    echo "  (refreshing AlecaFrame data cache json.7z from the CDN so init will not hang...)"
+    tmp="$CD/json.7z.dl"
+    curl -fsSL "$AF_DATA_CDN/json.7z" -o "$tmp" 2>/dev/null
+    got=$(md5sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [ -n "$got" ] && [ "$got" = "$rmd5" ]; then
+        mv -f "$tmp" "$CD/json.7z"; printf '%s  json.7z\n' "$rmd5" > "$CD/receivedMD5.txt"; echo "  (data cache ready: $rmd5)"
+    else
+        rm -f "$tmp"; echo "  (WARN: could not refresh json.7z; if AlecaFrame hangs at startup, that is why)"
+    fi
+}
+
+# ---------- data scanner state ----------
+gep_loaded() {   # scanner attached in the CURRENT provider session (each start logs "Game Service Initialized")
+    [ -f "$GEP_LOG" ] || return 1
+    awk '/Game Service Initialized|==== *new session/ { buf=""; next } { buf=buf $0 ORS }
+         END { if (buf ~ /Warframe plugin loaded:.*success/ || buf ~ /detected renderer: D3D/) exit 0; else exit 1 }' "$GEP_LOG" 2>/dev/null
+}
+
+# ---------- injection into the running launcher container ----------
+inject() {
+    if [ "$INJECT_MODE" = "steam" ]; then
+        local exe="$1"; shift
+        setsid nohup "$SLR_LAUNCH_CLIENT" --bus-name="com.steampowered.App$STEAM_APPID" --directory="$(dirname "$exe")" \
+            -- wine "$exe" "$@" </dev/null >>"$LOG" 2>&1 &
+    else
+        setsid nohup env "${UMU_ENV[@]}" PROTON_VERB=runinprefix UMU_RUNTIME_UPDATE=0 \
+            umu-run "$@" </dev/null >>"$LOG" 2>&1 &
+    fi
+}
+
+# ---------- overlay containment ----------
+contain_overlay_windows() {
+    command -v xdotool >/dev/null || return 0
+    local w
+    for w in $(xdotool search --name '^ow overlay$' 2>/dev/null) $(xdotool search --name '^Overwolf Quick Launcher$' 2>/dev/null); do
+        xdotool windowminimize "$w" 2>/dev/null
+    done
+}
+kill_overlays() {   # the overlay process is only needed until the scanner has attached; afterwards it can hog CPU and
+    local p         # install a global input hook that freezes the game's controls. Data keeps flowing after killing it.
+    for p in $(ps -eo pid,comm | awk '$2 ~ /^ow-overlay/ {print $1}'); do
+        kill -TERM "$p" 2>/dev/null && echo "$(date +%H:%M:%S) killed ow-overlay pid=$p (scanner already attached)" >> "$LOG"
+    done
+}
+reap_dead_overlays() {
+    # NOTE: Overwolf's --game-pid is a *Windows* PID and cannot be checked against Linux /proc.
+    game_running && return 0
+    local p
+    for p in $(ps -eo pid,comm | awk '$2 ~ /^ow-overlay/ {print $1}'); do
+        kill -TERM "$p" 2>/dev/null && echo "$(date +%H:%M:%S) reaped ow-overlay pid=$p (game not running)" >> "$LOG"
+    done
+}
+overlay_reaper_loop() {
+    local misses=0 tick=0 last_reattach=0 now
+    while :; do
+        reap_dead_overlays
+        contain_overlay_windows
+        tick=$((tick+1))
+        if [ $((tick % 2)) -eq 0 ] && game_running; then
+            if gep_loaded; then
+                [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ] && kill_overlays
+            else
+                # watchdog: the provider missed the game (idle shutdown, or the first injection timed out during the
+                # game's startup). A clean restart of Overwolf+AlecaFrame attaches to the live game.
+                now=$(date +%s)
+                if [ "$(game_age)" -ge "$REATTACH_AFTER" ] && [ $((now - last_reattach)) -ge 240 ] && overwolf_running; then
+                    echo "$(date +%H:%M:%S) scanner not attached after $(game_age)s of game time; re-attaching Overwolf" >> "$LOG"
+                    last_reattach=$now
+                    do_reattach >> "$LOG" 2>&1
+                fi
+            fi
+        fi
+        if ! overwolf_running; then misses=$((misses+1)); [ "$misses" -ge 10 ] && break; else misses=0; fi
+        sleep 1
+    done
+    rm -f "$REAPER_PIDFILE"
+}
+start_overlay_reaper() {
+    if [ -f "$REAPER_PIDFILE" ] && kill -0 "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null; then return 0; fi
+    setsid "$0" reap </dev/null >>"$LOG" 2>&1 &
+    echo "  (overlay containment armed)"
+}
+stop_overlay_reaper() {
+    if [ -f "$REAPER_PIDFILE" ]; then kill -TERM "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null; rm -f "$REAPER_PIDFILE"; fi
+}
+stop_overwolf() {
+    local PIDS
+    PIDS=$(ps -eo pid,comm 2>/dev/null | awk '$2 ~ /^Overwolf|^ow-overlay|^OWUninst/ {print $1}' | tr '\n' ' ')
+    [ -n "$PIDS" ] && { kill -TERM $PIDS 2>/dev/null; sleep 4; }
+    PIDS=$(ps -eo pid,comm 2>/dev/null | awk '$2 ~ /^Overwolf|^ow-overlay/ {print $1}' | tr '\n' ' ')
+    [ -n "$PIDS" ] && { kill -KILL $PIDS 2>/dev/null; sleep 2; }
+}
+
+wait_for_init() {
+    local secs="${1:-120}" i=0
+    while [ "$i" -lt "$secs" ]; do
+        grep -q "Plugin initialization successful" "$AF_BGLOG" 2>/dev/null && return 0
+        i=$((i+1)); sleep 1
+    done
+    return 1
+}
+
+do_reattach() {   # restart ONLY Overwolf+AlecaFrame while the game keeps running
+    local i
+    echo "Re-attaching: restarting Overwolf + AlecaFrame (the game is left alone)..."
+    stop_overwolf
+    ensure_data_cache
+    : > "$AF_BGLOG" 2>/dev/null || true
+    inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+    i=0
+    while [ "$i" -lt 180 ]; do
+        gep_loaded && { echo "Data scanner: LOADED after ${i}s."; return 0; }
+        i=$((i+5)); sleep 5
+    done
+    echo "Data scanner still not attached after 180s. Check: alecaframe logs"
+    return 1
+}
+
+do_prepare() {
+    need_profile
+    if overwolf_running && ! game_running; then
+        echo "Overwolf/AlecaFrame already running. For a clean start: alecaframe stop, then alecaframe prepare."
+        return 0
+    fi
+    if ! launcher_container_up && ! game_running; then
+        echo "The Warframe LAUNCHER is not running yet. Order: 'alecaframe warframe' -> wait for READY -> press Play."
+        return 1
+    fi
+    if game_running; then
+        echo "Warframe.x64.exe is already running: re-attaching instead (provider attaches to the live game)."
+        apply_oopo_mode; ensure_manifest_patches
+        do_reattach; local rc=$?
+        start_overlay_reaper
+        return $rc
+    fi
+    echo "Preparing Overwolf + AlecaFrame in the launcher's container..."
+    apply_oopo_mode
+    ensure_overlay_on
+    check_overlay_not_remotely_disabled
+    ensure_manifest_patches
+    ensure_data_cache
+    : > "$AF_BGLOG" 2>/dev/null || true
+    echo "Starting Overwolf + AlecaFrame (single launch)..."
+    inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+    local i=0 ow_up=0
+    while [ "$i" -lt 90 ]; do overwolf_running && { ow_up=1; break; }; i=$((i+1)); sleep 1; done
+    [ "$ow_up" -eq 1 ] || { echo "Overwolf did not start. See $LOG"; return 1; }
+    start_overlay_reaper
+    echo "Waiting for AlecaFrame to start..."
+    local j=0 af_started=0
+    while [ "$j" -lt 60 ]; do
+        if grep -qE 'Plugin (early )?initialization (started|completed)|Starting plugin initialization|Plugin instantiated|Checking local data MD5|Plugin initialization successful' "$AF_BGLOG" 2>/dev/null; then af_started=1; break; fi
+        if [ "$j" -eq 30 ]; then echo "  (slow start; re-issuing the launch once)"; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"; fi
+        j=$((j+1)); sleep 1
+    done
+    [ "$af_started" -eq 1 ] || { echo "AlecaFrame did not start. Try: alecaframe stop, then alecaframe prepare."; return 1; }
+    echo "Waiting for AlecaFrame to finish initializing (up to 120s)..."
+    if wait_for_init 120; then
+        echo; echo "============================================================"
+        echo " READY - AlecaFrame initialized. Press PLAY in the Warframe launcher now"
+        echo " (soon: Overwolf's events provider idles out ~20 s after it starts; the"
+        echo " watchdog re-attaches automatically if that happens)."
+        echo " After the game is up, confirm the data feed with:  alecaframe check-data"
+        echo "============================================================"
+        return 0
+    fi
+    echo "AlecaFrame did not report 'initialization successful' in time. Check: tail -n 40 \"$AF_BGLOG\""
+    return 1
+}
+
+case "${1:-}" in
+    warframe)
+        need_profile; shift
+        if [ -z "${NO_ALECA:-}" ]; then setsid "$0" wait-prepare >"$LOGDIR/autostart.log" 2>&1 & echo "[alecaframe] auto-prepare running in the background: tail -f $LOGDIR/autostart.log"; fi
+        if [ "$INJECT_MODE" = "steam" ]; then exec xdg-open "steam://rungameid/$STEAM_APPID"; fi
+        exec env "${UMU_ENV[@]}" umu-run "$(resolve_launcher)" "$@"
+        ;;
+    reap)
+        echo $$ > "$REAPER_PIDFILE"; overlay_reaper_loop; exit 0 ;;
+    stop)
+        echo "Stopping Overwolf/AlecaFrame (the game is left alone)..."
+        stop_overlay_reaper; stop_overwolf; echo "  done" ;;
+    check-data)
+        overwolf_running || { echo "Overwolf is not running; start via 'alecaframe warframe' first."; exit 1; }
+        if gep_loaded; then echo "Data scanner: LOADED (AlecaFrame is getting live game data)."; exit 0; fi
+        echo "Data scanner: NOT loaded yet. It loads after the overlay renders its first in-game frame, so the GAME must be running."
+        echo "If the game has been running for a while: alecaframe reattach"; exit 1 ;;
+    recover|unfreeze)
+        kill_overlays; contain_overlay_windows; reap_dead_overlays; start_overlay_reaper
+        echo "Overlay process killed and containment armed. If the game is still frozen, wait 5 s and run it again." ;;
+    reattach)
+        need_profile; do_reattach; start_overlay_reaper ;;
+    status)
+        launcher_container_up && echo "Warframe launcher: RUNNING" || echo "Warframe launcher: not running"
+        game_running && echo "Warframe game:     RUNNING (Warframe.x64.exe, up $(game_age)s)" || echo "Warframe game:     not running"
+        overwolf_running && echo "Overwolf:          RUNNING" || echo "Overwolf:          not running"
+        if overwolf_running; then gep_loaded && echo "Data scanner:      LOADED" || echo "Data scanner:      not loaded (yet)"; fi
+        [ -f "$REAPER_PIDFILE" ] && kill -0 "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null && echo "Overlay containment: ARMED"
+        echo "Profile: $CONF"; echo "  WINEPREFIX=$WINEPREFIX"; echo "  PROTONPATH=$PROTONPATH"; echo "  LAUNCHER=$(resolve_launcher)"
+        echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)" ;;
+    wait-prepare)
+        if overwolf_running && ! grep -q 'Plugin initialization successful' "$AF_BGLOG" 2>/dev/null; then
+            echo "[alecaframe] stale Overwolf detected; stopping it first." >&2; stop_overwolf
+        fi
+        i=0
+        while [ "$i" -lt 180 ]; do
+            game_running && { echo "[alecaframe] game already running; re-attaching." >&2; do_prepare; exit $?; }
+            if launcher_container_up; then sleep 5; do_prepare; exit $?; fi
+            i=$((i+1)); sleep 1
+        done
+        exit 0 ;;
+    prepare|"")
+        do_prepare ;;
+    logs)
+        echo "--- Overwolf trace"; T=$(ls -t "$OW_APPDATA"/Log/Trace_*.log 2>/dev/null | head -1); [ -n "$T" ] && tr -d '\r' < "$T" | tail -n 15 | cut -c1-200
+        echo "--- AlecaFrame background"; [ -f "$AF_BGLOG" ] && grep -v 'Failed to get player username' "$AF_BGLOG" | tail -n 15 | cut -c1-200
+        echo "--- events provider"; [ -f "$GEP_LOG" ] && tail -n 10 "$GEP_LOG" | cut -c1-200
+        echo "--- launcher/containment"; tail -n 10 "$LOG" 2>/dev/null ;;
+    profile)
+        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
+        echo "launcher resolves to: $(resolve_launcher)" ;;
+    doctor)
+        ok() { echo "  [ok]   $*"; }; bad() { echo "  [!!]   $*"; }
+        command -v umu-run >/dev/null && ok "umu-run $(umu-run --version 2>/dev/null | head -1)" || bad "umu-run not found (install umu-launcher)"
+        for t in python3 curl xdotool wmctrl; do command -v $t >/dev/null && ok "$t" || bad "$t missing$( [ "$t" = xdotool ] || [ "$t" = wmctrl ] && echo ' (optional: overlay window containment)')"; done
+        ps=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "?")
+        if [ "$ps" = "0" ]; then ok "kernel.yama.ptrace_scope=0 (Wine's ReadProcessMemory between sibling processes works)"; else bad "kernel.yama.ptrace_scope=$ps: the data scanner may read nothing. Fedora/Nobara ship 0; Ubuntu/Arch ship 1. To change (needs root): sudo sysctl kernel.yama.ptrace_scope=0 (persist in /etc/sysctl.d/). This lowers a system-wide hardening knob; see README."; fi
+        [ -n "$WINEPREFIX" ] && [ -d "$WINEPREFIX/drive_c" ] && ok "prefix $WINEPREFIX" || bad "prefix missing"
+        [ -d "$HOME/.local/share/Steam/compatibilitytools.d/$PROTONPATH" ] && ok "Proton $PROTONPATH" || bad "Proton $PROTONPATH not in ~/.local/share/Steam/compatibilitytools.d"
+        [ -f "$OW_LAUNCHER" ] && ok "Overwolf installed" || bad "Overwolf not installed in the prefix"
+        grep -q '"Release"=dword:00080' "$WINEPREFIX/system.reg" 2>/dev/null && ok ".NET Framework 4.8 in prefix" || bad ".NET Framework 4.8 missing in prefix"
+        [ -d "$OW_APPDATA/Extensions/$AF_EXTID" ] && ok "AlecaFrame installed ($(ls "$OW_APPDATA/Extensions/$AF_EXTID" | tail -1))" || bad "AlecaFrame not installed in Overwolf"
+        [ -f "$(resolve_launcher)" ] && ok "launcher: $(resolve_launcher)" || bad "launcher not found: $(resolve_launcher)"
+        [ -d "$GAME_DIR/Public" ] && ok "game content: $GAME_DIR/Public" || bad "game content dir missing: $GAME_DIR/Public" ;;
+    install-kwin-rules)
+        command -v kwriteconfig6 >/dev/null || { echo "kwriteconfig6 not found (KDE Plasma 6 only)"; exit 1; }
+        RC="$HOME/.config/kwinrulesrc"
+        add_rule() {
+            local id="$1" title="$2"; shift 2
+            kwriteconfig6 --file "$RC" --group "$id" --key Description "AlecaFrame: $title"
+            kwriteconfig6 --file "$RC" --group "$id" --key title "$title"
+            kwriteconfig6 --file "$RC" --group "$id" --key titlematch 1
+            kwriteconfig6 --file "$RC" --group "$id" --key wmclass "steam_app"
+            kwriteconfig6 --file "$RC" --group "$id" --key wmclassmatch 2
+            while [ $# -gt 0 ]; do kwriteconfig6 --file "$RC" --group "$id" --key "${1%%=*}" "${1#*=}"; shift; done
+        }
+        add_rule aleca-ow-overlay "ow overlay" below=true belowrule=2 skiptaskbar=true skiptaskbarrule=2 skipswitcher=true skipswitcherrule=2 skippager=true skippagerrule=2 acceptfocus=false acceptfocusrule=2 minimize=true minimizerule=3
+        add_rule aleca-ow-quick "Overwolf Quick Launcher" skiptaskbar=true skiptaskbarrule=2 minimize=true minimizerule=3
+        cur=$(kreadconfig6 --file "$RC" --group General --key rules)
+        new="$cur"; for id in aleca-ow-overlay aleca-ow-quick; do case ",$new," in *",$id,"*) ;; *) new="${new:+$new,}$id";; esac; done
+        kwriteconfig6 --file "$RC" --group General --key rules "$new"
+        qdbus org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || qdbus-qt6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1
+        echo "KWin rules installed: $new" ;;
+    *)
+        echo "Usage: alecaframe warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules"; exit 2 ;;
+esac

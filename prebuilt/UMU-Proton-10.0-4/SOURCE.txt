@@ -1,0 +1,6 @@
+ntdll.dll (x86_64, PE) built from:
+  https://github.com/ValveSoftware/wine  commit b8fdff8e1f855b5276ec4ddca0f31b2792554322
+  (the wine submodule of Proton 10.0-4 and of Open-Wine-Components/umu-proton tag UMU-Proton-10.0-4)
+  + ../../wine-patch/ntdll-cor-entry.patch
+  toolchain: Fedora mingw64-gcc 16.2.1, built with ../../wine-patch/build-ntdll.sh, stripped (--strip-debug)
+License: LGPL-2.1-or-later (Wine). Replaces files/lib/wine/x86_64-windows/ntdll.dll in a COPY of UMU-Proton-10.0-4 only.

@@ -1,0 +1,83 @@
+From 2cdc3fd9adce3dc96e69d2832f477685f21677a4 Mon Sep 17 00:00:00 2001
+From: Talis <109205402+LordTalis@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:12:21 -0500
+Subject: [PATCH] ntdll: Start managed executables that are not IL-only through
+ mscoree.
+
+The Windows loader routes every image that has a COM descriptor directory
+through mscoree (_CorExeMain), not only IL-only ones. A PE32+ managed
+executable whose CLR flags lack COMIMAGE_FLAGS_ILONLY (e.g. one with a
+native import added by a post-build tool) has AddressOfEntryPoint == 0;
+Wine resolved its imports and then jumped to the image base.
+
+Resolve such an image's imports normally and then use _CorExeMain as its
+entry point, like the IL-only path does. Fixes Overwolf 0.311's
+OverwolfBrowser.exe.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=NNNNN
+Signed-off-by: Talis <109205402+LordTalis@users.noreply.github.com>
+---
+ dlls/ntdll/loader.c | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index bc71fe0..a47e694 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1498,6 +1498,40 @@ static NTSTATUS fixup_imports_ilonly( WINE_MODREF *wm, LPCWSTR load_path, void *
+ }
+ 
+ 
++/****************************************************************
++ *       fixup_cor_entry
++ *
++ * Route a managed (CLR header) executable that is not flagged IL-only and has no
++ * native entry point through mscoree, like the Windows loader does for every image
++ * with a COM descriptor directory. Such images (e.g. strong-named PE32+ assemblies
++ * with added native imports) have AddressOfEntryPoint == 0 and would otherwise
++ * jump to their image base.
++ * The loader_section must be locked while calling this function.
++ */
++static NTSTATUS fixup_cor_entry( WINE_MODREF *wm, LPCWSTR load_path, void **entry )
++{
++    NTSTATUS status;
++    void *proc;
++    WINE_MODREF *imp;
++
++    if (!(status = load_dll( load_path, L"mscoree.dll", 0, &imp, FALSE ))
++          && !add_module_dependency( wm->ldr.DdagNode, imp->ldr.DdagNode ))
++        status = STATUS_NO_MEMORY;
++    if (status)
++    {
++        ERR( "mscoree.dll not found, managed binary %s cannot be loaded\n",
++             debugstr_w(wm->ldr.BaseDllName.Buffer) );
++        return status;
++    }
++
++    TRACE( "loaded mscoree for managed non-ILONLY %s\n", debugstr_w(wm->ldr.FullDllName.Buffer) );
++
++    if (!(proc = RtlFindExportedRoutineByName( imp->ldr.DllBase, "_CorExeMain" ))) return STATUS_PROCEDURE_NOT_FOUND;
++    *entry = proc;
++    return STATUS_SUCCESS;
++}
++
++
+ /****************************************************************
+  *       fixup_imports
+  *
+@@ -4683,7 +4717,12 @@ void loader_init( CONTEXT *context, void **entry )
+         if (wm->ldr.Flags & LDR_COR_ILONLY)
+             status = fixup_imports_ilonly( wm, NULL, entry );
+         else
++        {
+             status = fixup_imports( wm, NULL );
++            if (!status && (wm->ldr.Flags & LDR_COR_IMAGE) &&
++                !RtlImageNtHeader( wm->ldr.DllBase )->OptionalHeader.AddressOfEntryPoint)
++                status = fixup_cor_entry( wm, NULL, entry );
++        }
+ 
+         if (status)
+         {
+-- 
+2.55.0
+
