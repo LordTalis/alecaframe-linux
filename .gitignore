@@ -1,2 +1,6 @@
 *.log
 wine-build-work/
+
+# stray runtime caches if the game is ever run from here
+*.dxvk-cache
+*.log
