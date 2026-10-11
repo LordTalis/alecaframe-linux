@@ -10,7 +10,7 @@
 #   3. press Play in the launcher, log in in-game
 #   4. alecaframe check-data -> confirms Overwolf's data scanner attached to the game
 #
-# Commands: warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules
+# Commands: warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules | install-launcher
 
 set -u
 
@@ -534,10 +534,43 @@ do_prepare() {
         echo " watchdog re-attaches automatically if that happens)."
         echo " After the game is up, confirm the data feed with:  alecaframe check-data"
         echo "============================================================"
+        notify_ready
         return 0
     fi
     echo "AlecaFrame did not report 'initialization successful' in time. Check: tail -n 40 \"$AF_BGLOG\""
     return 1
+}
+
+notify_ready() {   # desktop toast, so a one-click launcher does not need a visible terminal to tell you when to press Play
+    command -v notify-send >/dev/null || return 0
+    local icon="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux/warframe.png"
+    [ -f "$icon" ] || icon=input-gaming
+    notify-send -a AlecaFrame -i "$icon" "AlecaFrame ready" "Press PLAY in the Warframe launcher, then log in." 2>/dev/null || true
+}
+install_launcher() {   # an app-menu entry "Warframe + AlecaFrame" that runs this tool's `warframe` command
+    local self app icon src
+    self="$(command -v "$0" 2>/dev/null)"; [ -x "$self" ] || self="$(readlink -f "$0")"
+    app="${XDG_DATA_HOME:-$HOME/.local/share}/applications"; mkdir -p "$app"
+    icon="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux/warframe.png"
+    src="$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Overwolf/DockIconsCache/DockIcon_8954_64_Normal.png"
+    [ -f "$src" ] && cp -f "$src" "$icon" 2>/dev/null
+    [ -f "$icon" ] || icon=input-gaming
+    cat > "$app/alecaframe-warframe.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Warframe + AlecaFrame
+GenericName=Warframe with AlecaFrame
+Comment=Launch Warframe with AlecaFrame (Overwolf) attached
+Exec=$self warframe
+Icon=$icon
+Terminal=false
+StartupNotify=true
+Categories=Game;
+EOF
+    chmod +x "$app/alecaframe-warframe.desktop" 2>/dev/null
+    command -v update-desktop-database >/dev/null && update-desktop-database "$app" 2>/dev/null || true
+    echo "  installed: $app/alecaframe-warframe.desktop"
+    echo "  Launch \"Warframe + AlecaFrame\" from your app menu (right-click it there to pin it to the taskbar)."
 }
 
 case "${1:-}" in
@@ -562,6 +595,8 @@ case "${1:-}" in
         echo "Overlay process killed and containment armed. If the game is still frozen, wait 5 s and run it again." ;;
     reattach)
         need_profile; do_reattach; start_overlay_reaper ;;
+    install-launcher)
+        need_profile; install_launcher ;;
     status)
         launcher_container_up && echo "Warframe launcher: RUNNING" || echo "Warframe launcher: not running"
         game_running && echo "Warframe game:     RUNNING (Warframe.x64.exe, up $(game_age)s)" || echo "Warframe game:     not running"
@@ -624,5 +659,5 @@ case "${1:-}" in
         qdbus org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || qdbus-qt6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1
         echo "KWin rules installed: $new" ;;
     *)
-        echo "Usage: alecaframe warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules"; exit 2 ;;
+        echo "Usage: alecaframe warframe | prepare | reattach | unfreeze | stop | status | check-data | logs | profile | doctor | install-kwin-rules | install-launcher"; exit 2 ;;
 esac

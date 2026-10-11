@@ -72,6 +72,7 @@ alecaframe status | logs | stop
 alecaframe reattach      # scanner never attached: restart Overwolf+AlecaFrame under the running game
 alecaframe unfreeze      # controls frozen: kill the overlay process (data keeps flowing)
 alecaframe doctor        # checks prerequisites and the install
+alecaframe install-launcher   # add a "Warframe + AlecaFrame" entry to your app menu (one-click; notifies when to press Play)
 NO_ALECA=1 alecaframe warframe   # game only
 ```
 
