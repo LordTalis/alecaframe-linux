@@ -376,6 +376,12 @@ gep_loaded() {   # scanner attached in the CURRENT provider session (each start 
     awk '/Game Service Initialized|==== *new session/ { buf=""; next } { buf=buf $0 ORS }
          END { if (buf ~ /Warframe plugin loaded:.*success/ || buf ~ /detected renderer: D3D/) exit 0; else exit 1 }' "$GEP_LOG" 2>/dev/null
 }
+inventory_ready() {   # true once AlecaFrame has captured the inventory this session. A large account's inventory can
+    local logs        # take much longer to scan than the GEP session takes to start, so this gates the overlay kill:
+    logs=$(ls -t "$(dirname "$AF_BGLOG")"/BackGround.html*.log 2>/dev/null | head -2)   # killing the overlay before
+    [ -n "$logs" ] || return 1                                                          # capture makes Overwolf drop
+    grep -a -q 'New inventory data' $logs 2>/dev/null                                   # the game and lose the data.
+}
 
 # ---------- injection into the running launcher container ----------
 inject() {
@@ -418,13 +424,18 @@ overlay_reaper_loop() {
         contain_overlay_windows
         tick=$((tick+1))
         if [ $((tick % 2)) -eq 0 ] && game_running; then
-            if gep_loaded; then
+            if gep_loaded && inventory_ready; then
+                # inventory captured: safe to free input by killing the overlay (the data was cached and persists).
                 [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ] && kill_overlays
+            elif gep_loaded; then
+                :   # attached but the inventory is not captured yet -> keep the overlay alive so the scan can finish,
+                    # however large the account. Killing it here is what made Overwolf drop the game before capture.
             else
                 # watchdog: the provider missed the game (idle shutdown, or the first injection timed out during the
-                # game's startup). A clean restart of Overwolf+AlecaFrame attaches to the live game.
+                # game's startup). A clean restart of Overwolf+AlecaFrame attaches to the live game. Only while we have
+                # never captured the inventory; once captured, a teardown is harmless and we stop reattaching.
                 now=$(date +%s)
-                if [ "$(game_age)" -ge "$REATTACH_AFTER" ] && [ $((now - last_reattach)) -ge 240 ] && overwolf_running; then
+                if ! inventory_ready && [ "$(game_age)" -ge "$REATTACH_AFTER" ] && [ $((now - last_reattach)) -ge 240 ] && overwolf_running; then
                     echo "$(date +%H:%M:%S) scanner not attached after $(game_age)s of game time; re-attaching Overwolf" >> "$LOG"
                     last_reattach=$now
                     do_reattach >> "$LOG" 2>&1

@@ -12,13 +12,18 @@ setup (don't report issues there), and Digital Extremes' policy for all third-pa
 ## What you get
 
 - `alecaframe warframe` starts Warframe's standalone launcher in its own Proton prefix and brings up
-  Overwolf + AlecaFrame inside the same container; press Play, log in, and AlecaFrame's inventory, relic,
-  mastery and market views populate from the live game, exactly like on Windows.
-- The one thing that does **not** work is Overwolf's in-game Ctrl+Tab overlay (DXVK has no cross-process
-  shared D3D11 textures). You use AlecaFrame's own window on the desktop instead.
-- A watchdog handles Overwolf's two Wine quirks for you: the events provider missing the game (it idles out
-  20 s after start) and the overlay process grabbing keyboard/mouse (it is killed once the data scanner has
-  attached; data keeps flowing).
+  Overwolf + AlecaFrame inside the same container; press Play, log in, and AlecaFrame's **desktop window**
+  populates from the live game: inventory, the relic planner, mastery, market, and the rivens you own.
+- What does **not** work is anything Overwolf draws **inside the game** or reads from a **screenshot**, because
+  DXVK has no cross-process shared D3D11 textures: the Ctrl+Tab overlay, the relic-reward reader that OCRs the
+  mission reward screen, and the riven side panel / live price-check all render black or fail to capture. These
+  are a real loss (the relic and riven overlays are among AlecaFrame's biggest draws). For live reward/riven
+  recognition on Linux, a native tool such as [TennoScope](https://github.com/Deftera186/tennoscope) or a Wine
+  build of a riven/relic analyzer is the route; AlecaFrame here gives you the window-based views instead.
+- A watchdog handles Overwolf's Wine quirks for you: the events provider missing the game (it idles out ~20 s
+  after start), and the overlay process grabbing keyboard/mouse. The overlay is killed to free your input, but
+  only **after** the inventory has been captured (a large account's inventory takes longer to scan than the
+  overlay survives otherwise; killing it early makes Overwolf drop the game before the data is read).
 
 ## Why there is a patched Proton copy
 
@@ -112,8 +117,12 @@ If you want no memory reading at all, use [TennoScope](https://github.com/Defter
 
 ## Known limitations
 
-- In-game overlay renders black (DXVK). Keep it enabled anyway; its first frame loads the data scanner.
-- A brief input hiccup right after Play is possible while the overlay injects (seconds), then it is killed.
+- **In-game overlays and screenshot features do not work** (DXVK, no cross-process shared textures): the
+  Ctrl+Tab overlay, the relic-reward reader (OCRs the reward screen), and the riven side panel / price-check.
+  Everything memory-based works in AlecaFrame's desktop window; for live reward/riven OCR use a native tool.
+- Large inventories: the overlay must stay alive until the inventory is captured, or Overwolf drops the game
+  before the scan finishes. The tool handles this (it kills the overlay only after the data is cached), so the
+  first capture after login can take up to a minute during which a brief input grab is possible.
 - Press Play soon after READY; the watchdog recovers if you don't, about a minute into the game.
 - Dragging AlecaFrame's window may make it jump (Overwolf native drag under Wine).
 - Only the 64-bit `ntdll.dll` is patched. The prebuilt DLL matches UMU-Proton-10.0-4 exactly.
@@ -129,6 +138,13 @@ tool). `alecaframe warframe` on that install brought the launcher to DE's EULA a
 Overwolf + AlecaFrame injected. `repro/make-repro.sh` in the same prefix: stock UMU-Proton-10.0-4 crashes at
 `0x140000000`, the patched copy prints hello. On a second machine-local install (same pipeline) a dummy
 account logged in and AlecaFrame received the inventory from the memory scanner.
+
+Same day, evening: a full main account (large inventory) logged in and AlecaFrame captured and cached the
+inventory (2.24 MB) in its desktop window, after the overlay-kill was gated on the inventory actually being
+captured. Before that gate, the watchdog killed the overlay seconds after attach and Overwolf dropped the game
+before the big inventory finished scanning, so nothing populated; the fix holds the overlay alive until the
+first `New inventory data`, then kills it to free input. The in-game relic-reward overlay and riven side panel
+were confirmed non-functional under DXVK (overlay renders null; the screenshot OCR path errors), as expected.
 
 ## Credits and license
 
