@@ -155,6 +155,14 @@ before the big inventory finished scanning, so nothing populated; the fix holds 
 first `New inventory data`, then kills it to free input. The in-game relic-reward overlay and riven side panel
 were confirmed non-functional under DXVK (overlay renders null; the screenshot OCR path errors), as expected.
 
+2026-10-18: Overwolf replaced its games list (8963668 -> 8963674) right after starting, dropping the OOPO
+patch. The provider saw `oopOverlay:false`, the overlay ran inside the game (about 72 Wine stub aborts per second,
+stutter, frozen controls) and the old watchdog's second re-attach killed the game (exit 0xC0000409). With the
+re-patch-after-fetch gate and the one-re-attach watchdog, the next run logged `is oop overlay true`, loaded the
+plugin, captured the inventory in under a minute, had zero stub aborts and survived 10+ minutes. Overwolf's own
+"Time for a break" self-restart (Overwolf.exe above about 900 MB) still fires sometimes; it re-injects the out-of-process
+overlay, and the game has survived that every time so far.
+
 ## Credits and license
 
 Scripts and docs: MIT (see `LICENSE`). `wine-patch/` and `prebuilt/`: LGPL-2.1-or-later (Wine).
