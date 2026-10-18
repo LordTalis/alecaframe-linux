@@ -8,7 +8,8 @@ PROTONPATH="UMU-Proton-10.0-4-netfix"                 # UMU-Proton 10.0-4 + patc
 OOPO_MODE="on"                                        # on = live data on DXVK
 NEUTER_REMOTE_DISABLE="0"                             # 1 = override Overwolf's remote overlay-disable list locally
 OVERLAY_KILL_WHEN_LOADED="1"                          # kill ow-overlay.exe once the scanner is attached (input-grab fix)
-REATTACH_AFTER="75"                                   # seconds of game time without scanner before auto re-attach
+REATTACH_AFTER="75"                                   # seconds of game time without scanner before the one auto re-attach
+GIVEUP_AFTER="300"                                    # seconds of game time without data before the overlay is stopped for good
 # Experimental: run against Steam's own Warframe instead (launch option STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%)
 # INJECT_MODE="steam"
 # STEAM_APPID="230410"

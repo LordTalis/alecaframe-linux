@@ -28,7 +28,8 @@ AF_EXTID="afmcagbpgggkpdkokjhjkllpegnadmkignlonpjm"
 OOPO_MODE="on"                 # on = live data on DXVK (overlay injects, renderer detected); off = stale data
 NEUTER_REMOTE_DISABLE="0"      # 1 = rewrite Overwolf's overlay_disabled_games.json entry for Warframe (normally unnecessary)
 OVERLAY_KILL_WHEN_LOADED="1"   # once the scanner has attached, kill Overwolf's overlay process (it can freeze game input)
-REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf
+REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf (once)
+GIVEUP_AFTER="300"             # seconds of game uptime without captured data before the watchdog kills the overlay and stops
 INJECT_MODE="umu"              # umu = re-enter the umu-run container; steam = Valve launcher service (experimental)
 STEAM_APPID="230410"
 SLR_LAUNCH_CLIENT=""
@@ -118,6 +119,26 @@ apply_oopo_mode() {
             remove_oopo "$GL" && echo "  (removed <OOPO> for Warframe from $(basename "$GL"))"
         fi
     done
+}
+# Overwolf fetches a newer GamesList.<version>.xml from its CDN every week or two, usually right after it starts, and the
+# fresh copy replaces the one we patched. Without OOPO the provider waits for a renderer DXVK never reports (no data) and
+# the overlay runs INSIDE the game (Wine stub aborts every frame: stutter, frozen input). So check the list Overwolf
+# actually loads (highest version), after it has started, not only before.
+newest_gameslist() {
+    local f v best="" bestv=-1
+    for f in "$OW_APPDATA"/GamesList.*.xml; do
+        [ -f "$f" ] || continue
+        v=${f##*/GamesList.}; v=${v%.xml}
+        case "$v" in ''|*[!0-9]*) continue ;; esac
+        [ "$v" -gt "$bestv" ] && { bestv=$v; best=$f; }
+    done
+    [ -n "$best" ] && printf '%s\n' "$best"
+}
+oopo_ok() {   # true when the games list Overwolf will load has OOPO for Warframe (always true with OOPO_MODE=off)
+    [ "$OOPO_MODE" = "on" ] || return 0
+    local gl; gl=$(newest_gameslist)
+    if [ -n "$gl" ]; then oopo_present_in "$gl"; return; fi
+    gameslist_files | { local n=0; while IFS= read -r gl; do oopo_present_in "$gl" || exit 1; n=$((n+1)); done; [ "$n" -gt 0 ]; }
 }
 
 # ---------- per-game overlay ON (required: the first overlay frame is what detects the renderer -> loads the scanner) ----------
@@ -376,6 +397,18 @@ gep_loaded() {   # scanner attached in the CURRENT provider session (each start 
     awk '/Game Service Initialized|==== *new session/ { buf=""; next } { buf=buf $0 ORS }
          END { if (buf ~ /Warframe plugin loaded:.*success/ || buf ~ /detected renderer: D3D/) exit 0; else exit 1 }' "$GEP_LOG" 2>/dev/null
 }
+gep_oopo_off() {   # the CURRENT provider session sees the game WITHOUT out-of-process overlay: the scanner can never attach
+    [ -f "$GEP_LOG" ] || return 1
+    awk '/Game Service Initialized|==== *new session/ { buf=""; next } { buf=buf $0 ORS }
+         END { if (buf ~ /"oopOverlay":false|is oop overlay false|Waiting for renderer\.\./) exit 0; else exit 1 }' "$GEP_LOG" 2>/dev/null
+}
+gep_written_since() {   # provider log written at/after epoch $1 (so it belongs to this game run, not an earlier one)
+    [ "$(stat -c %Y "$GEP_LOG" 2>/dev/null || echo 0)" -ge "$1" ]
+}
+gep_session_start() {   # epoch of the current provider session (timestamp on the first line of its log), 0 if unknown
+    local t; t=$(head -c 64 "$GEP_LOG" 2>/dev/null | tr -d '\r\357\273\277' | cut -c1-19)
+    [ -n "$t" ] && date -d "$t" +%s 2>/dev/null || echo 0
+}
 inventory_ready() {   # true once AlecaFrame has captured the inventory this session. A large account's inventory can
     local logs        # take much longer to scan than the GEP session takes to start, so this gates the overlay kill:
     logs=$(ls -t "$(dirname "$AF_BGLOG")"/BackGround.html*.log 2>/dev/null | head -2)   # killing the overlay before
@@ -404,9 +437,9 @@ contain_overlay_windows() {
     done
 }
 kill_overlays() {   # the overlay process is only needed until the scanner has attached; afterwards it can hog CPU and
-    local p         # install a global input hook that freezes the game's controls. Data keeps flowing after killing it.
-    for p in $(ps -eo pid,comm | awk '$2 ~ /^ow-overlay/ {print $1}'); do
-        kill -TERM "$p" 2>/dev/null && echo "$(date +%H:%M:%S) killed ow-overlay pid=$p (scanner already attached)" >> "$LOG"
+    local p why="${1:-scanner already attached}"   # install a global input hook that freezes the game's controls.
+    for p in $(ps -eo pid,comm | awk '$2 ~ /^ow-overlay/ {print $1}'); do      # Data keeps flowing after killing it.
+        kill -TERM "$p" 2>/dev/null && echo "$(date +%H:%M:%S) killed ow-overlay pid=$p ($why)" >> "$LOG"
     done
 }
 reap_dead_overlays() {
@@ -418,28 +451,44 @@ reap_dead_overlays() {
     done
 }
 overlay_reaper_loop() {
-    local misses=0 tick=0 last_reattach=0 now
+    # Per game run: at most ONE re-attach, then give up. Every re-attach injects Overwolf into the live game again; on
+    # 2026-10-18 the second one in a session killed it (exit 0xC0000409), so never loop on it.
+    local misses=0 tick=0 reattached=0 gave_up=0 age started
     while :; do
         reap_dead_overlays
         contain_overlay_windows
         tick=$((tick+1))
-        if [ $((tick % 2)) -eq 0 ] && game_running; then
-            if gep_loaded && inventory_ready; then
+        game_running || { reattached=0; gave_up=0; }
+        if [ $((tick % 2)) -eq 0 ] && [ "$gave_up" -eq 0 ] && game_running; then
+            age=$(game_age); started=$(( $(date +%s) - age ))
+            if [ "$OOPO_MODE" = "on" ] && gep_written_since "$started" && gep_oopo_off; then
+                # Overwolf loaded a games list without OOPO: no data this run, the overlay runs inside the game and
+                # stutters/freezes it, and re-injecting can crash it. Stopping Overwolf is safe for the game; patch the
+                # list for the next launch and tell the user instead of re-attaching.
+                echo "$(date +%H:%M:%S) provider sees the game WITHOUT OOPO (games list lost the patch); stopping Overwolf, no re-attach this run" >> "$LOG"
+                apply_oopo_mode >> "$LOG" 2>&1
+                stop_overwolf
+                notify_fail "Overwolf loaded a games list without the Linux fix, so it could not read this game session. Overwolf was stopped so the game stays smooth. The fix is re-applied: quit Warframe and start it again with 'alecaframe warframe'."
+                gave_up=1
+            elif gep_loaded && inventory_ready; then
                 # inventory captured: safe to free input by killing the overlay (the data was cached and persists).
                 [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ] && kill_overlays
+            elif ! inventory_ready && [ "$age" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; }; then
+                # still nothing captured this long into the game: stop holding the overlay (input grab, CPU) and stop
+                # trying. AlecaFrame's desktop window keeps the last cached data.
+                echo "$(date +%H:%M:%S) no inventory after ${age}s of game time; giving up for this run" >> "$LOG"
+                kill_overlays "giving up: no inventory captured"
+                notify_fail "AlecaFrame did not get live data this session. The overlay was stopped so your controls stay free; the game was left alone. Next time: 'alecaframe stop', then start with 'alecaframe warframe'."
+                gave_up=1
             elif gep_loaded; then
-                :   # attached but the inventory is not captured yet -> keep the overlay alive so the scan can finish,
-                    # however large the account. Killing it here is what made Overwolf drop the game before capture.
-            else
+                :   # attached but the inventory is not captured yet -> keep the overlay alive so the scan can finish
+                    # (up to GIVEUP_AFTER). Killing it early is what made Overwolf drop the game before capture.
+            elif [ "$reattached" -eq 0 ] && ! inventory_ready && [ "$age" -ge "$REATTACH_AFTER" ] && overwolf_running; then
                 # watchdog: the provider missed the game (idle shutdown, or the first injection timed out during the
-                # game's startup). A clean restart of Overwolf+AlecaFrame attaches to the live game. Only while we have
-                # never captured the inventory; once captured, a teardown is harmless and we stop reattaching.
-                now=$(date +%s)
-                if ! inventory_ready && [ "$(game_age)" -ge "$REATTACH_AFTER" ] && [ $((now - last_reattach)) -ge 240 ] && overwolf_running; then
-                    echo "$(date +%H:%M:%S) scanner not attached after $(game_age)s of game time; re-attaching Overwolf" >> "$LOG"
-                    last_reattach=$now
-                    do_reattach >> "$LOG" 2>&1
-                fi
+                # game's startup). One clean restart of Overwolf+AlecaFrame attaches to the live game.
+                echo "$(date +%H:%M:%S) scanner not attached after ${age}s of game time; re-attaching Overwolf (once per run)" >> "$LOG"
+                reattached=1
+                do_reattach >> "$LOG" 2>&1
             fi
         fi
         if ! overwolf_running; then misses=$((misses+1)); [ "$misses" -ge 10 ] && break; else misses=0; fi
@@ -473,15 +522,28 @@ wait_for_init() {
 }
 
 do_reattach() {   # restart ONLY Overwolf+AlecaFrame while the game keeps running
-    local i
+    local i t0
     echo "Re-attaching: restarting Overwolf + AlecaFrame (the game is left alone)..."
     stop_overwolf
+    # the list may have been refreshed since prepare; Overwolf reads it at startup, so patch it now, between stop and start
+    apply_oopo_mode; ensure_manifest_patches
+    if game_running && ! oopo_ok; then
+        echo "NOT re-attaching: could not set OOPO for Warframe in $(newest_gameslist). Injecting into the running game"
+        echo "without it runs the overlay inside the game (stutter, frozen input) and can crash it. Quit the game, then"
+        echo "'alecaframe warframe'."
+        return 1
+    fi
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
+    t0=$(date +%s)
     inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
     i=0
     while [ "$i" -lt 180 ]; do
         gep_loaded && { echo "Data scanner: LOADED after ${i}s."; return 0; }
+        if [ "$OOPO_MODE" = "on" ] && [ "$(gep_session_start)" -ge "$t0" ] && gep_oopo_off; then
+            echo "Provider started WITHOUT OOPO (oopOverlay=false); the scanner cannot attach this run. See: alecaframe doctor"
+            return 1
+        fi
         i=$((i+5)); sleep 5
     done
     echo "Data scanner still not attached after 180s. Check: alecaframe logs"
@@ -500,7 +562,6 @@ do_prepare() {
     fi
     if game_running; then
         echo "Warframe.x64.exe is already running: re-attaching instead (provider attaches to the live game)."
-        apply_oopo_mode; ensure_manifest_patches
         do_reattach; local rc=$?
         start_overlay_reaper
         return $rc
@@ -528,6 +589,23 @@ do_prepare() {
     [ "$af_started" -eq 1 ] || { echo "AlecaFrame did not start. Try: alecaframe stop, then alecaframe prepare."; return 1; }
     echo "Waiting for AlecaFrame to finish initializing (up to 120s)..."
     if wait_for_init 120; then
+        if ! oopo_ok; then
+            # Overwolf fetched a newer games list while starting, replacing the patched one. It has already loaded
+            # that list, so patch it and restart Overwolf once, while the game is not running yet.
+            echo "  (Overwolf downloaded a new games list ($(basename "$(newest_gameslist)")) without OOPO; patching it and restarting Overwolf...)"
+            stop_overlay_reaper; stop_overwolf
+            apply_oopo_mode
+            : > "$AF_BGLOG" 2>/dev/null || true
+            inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+            i=0; while [ "$i" -lt 90 ]; do overwolf_running && break; i=$((i+1)); sleep 1; done
+            start_overlay_reaper
+            if ! wait_for_init 120 || ! oopo_ok; then
+                echo "FAILED: Overwolf's games list still has no OOPO for Warframe ($(newest_gameslist))."
+                echo "Do not press Play with AlecaFrame now (the overlay would run inside the game). Run: alecaframe stop; alecaframe doctor"
+                notify_fail "Setup failed: Overwolf's games list could not be patched. Do not press Play with AlecaFrame; run 'alecaframe doctor'."
+                return 1
+            fi
+        fi
         echo; echo "============================================================"
         echo " READY - AlecaFrame initialized. Press PLAY in the Warframe launcher now"
         echo " (soon: Overwolf's events provider idles out ~20 s after it starts; the"
@@ -546,6 +624,12 @@ notify_ready() {   # desktop toast, so a one-click launcher does not need a visi
     local icon="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux/warframe.png"
     [ -f "$icon" ] || icon=input-gaming
     notify-send -a AlecaFrame -i "$icon" "AlecaFrame ready" "Press PLAY in the Warframe launcher, then log in." 2>/dev/null || true
+}
+notify_fail() {   # desktop toast when live data cannot work this run (the game itself is always left alone)
+    command -v notify-send >/dev/null || return 0
+    local icon="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux/warframe.png"
+    [ -f "$icon" ] || icon=input-gaming
+    notify-send -a AlecaFrame -u critical -i "$icon" "AlecaFrame: no live data" "$1" 2>/dev/null || true
 }
 install_launcher() {   # an app-menu entry "Warframe + AlecaFrame" that runs this tool's `warframe` command
     local self app icon src
@@ -588,6 +672,11 @@ case "${1:-}" in
     check-data)
         overwolf_running || { echo "Overwolf is not running; start via 'alecaframe warframe' first."; exit 1; }
         if gep_loaded; then echo "Data scanner: LOADED (AlecaFrame is getting live game data)."; exit 0; fi
+        if [ "$OOPO_MODE" = "on" ] && gep_oopo_off; then
+            echo "Data scanner: CANNOT load this run: the provider sees the game without OOPO (Overwolf refreshed its games list)."
+            echo "Quit the game, then: alecaframe stop; alecaframe warframe   (the list is re-patched on start)"; exit 1
+        fi
+        oopo_ok || echo "WARNING: Overwolf's newest games list has no OOPO for Warframe; 'alecaframe prepare' re-patches it."
         echo "Data scanner: NOT loaded yet. It loads after the overlay renders its first in-game frame, so the GAME must be running."
         echo "If the game has been running for a while: alecaframe reattach"; exit 1 ;;
     recover|unfreeze)
@@ -624,7 +713,7 @@ case "${1:-}" in
         echo "--- events provider"; [ -f "$GEP_LOG" ] && tail -n 10 "$GEP_LOG" | cut -c1-200
         echo "--- launcher/containment"; tail -n 10 "$LOG" 2>/dev/null ;;
     profile)
-        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
+        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER GIVEUP_AFTER INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
         echo "launcher resolves to: $(resolve_launcher)" ;;
     doctor)
         ok() { echo "  [ok]   $*"; }; bad() { echo "  [!!]   $*"; }
@@ -637,6 +726,13 @@ case "${1:-}" in
         [ -f "$OW_LAUNCHER" ] && ok "Overwolf installed" || bad "Overwolf not installed in the prefix"
         grep -q '"Release"=dword:00080' "$WINEPREFIX/system.reg" 2>/dev/null && ok ".NET Framework 4.8 in prefix" || bad ".NET Framework 4.8 missing in prefix"
         [ -d "$OW_APPDATA/Extensions/$AF_EXTID" ] && ok "AlecaFrame installed ($(ls "$OW_APPDATA/Extensions/$AF_EXTID" | tail -1))" || bad "AlecaFrame not installed in Overwolf"
+        if [ "$OOPO_MODE" = "on" ]; then
+            gl=$(newest_gameslist)
+            if [ -z "$gl" ]; then ok "no downloaded games list yet (Overwolf uses its bundled one)"
+            elif oopo_present_in "$gl"; then ok "OOPO set for Warframe in $(basename "$gl")"
+            else bad "OOPO missing for Warframe in $(basename "$gl") (Overwolf refreshed its games list; 'alecaframe prepare' re-patches it)"; fi
+            gep_oopo_off && bad "last provider session ran WITHOUT OOPO (oopOverlay=false): no live data that run"
+        fi
         [ -f "$(resolve_launcher)" ] && ok "launcher: $(resolve_launcher)" || bad "launcher not found: $(resolve_launcher)"
         [ -d "$GAME_DIR/Public" ] && ok "game content: $GAME_DIR/Public" || bad "game content dir missing: $GAME_DIR/Public" ;;
     install-kwin-rules)

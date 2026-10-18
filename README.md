@@ -69,7 +69,7 @@ alecaframe warframe      # launcher + Overwolf + AlecaFrame; wait for READY (tai
                          # then press Play (soon after READY) and log in in-game
 alecaframe check-data    # "LOADED" = Overwolf's scanner is reading the game
 alecaframe status | logs | stop
-alecaframe reattach      # scanner never attached: restart Overwolf+AlecaFrame under the running game
+alecaframe reattach      # scanner never attached: restart Overwolf+AlecaFrame under the running game (re-patches OOPO first)
 alecaframe unfreeze      # controls frozen: kill the overlay process (data keeps flowing)
 alecaframe doctor        # checks prerequisites and the install
 alecaframe install-launcher   # add a "Warframe + AlecaFrame" entry to your app menu (one-click; notifies when to press Play)
@@ -124,7 +124,15 @@ If you want no memory reading at all, use [TennoScope](https://github.com/Defter
 - Large inventories: the overlay must stay alive until the inventory is captured, or Overwolf drops the game
   before the scan finishes. The tool handles this (it kills the overlay only after the data is cached), so the
   first capture after login can take up to a minute during which a brief input grab is possible.
-- Press Play soon after READY; the watchdog recovers if you don't, about a minute into the game.
+- Press Play soon after READY. If the scanner misses the game, the watchdog re-attaches once (about a minute
+  in) and gives up after 5 minutes without data (`GIVEUP_AFTER`): overlay stopped, game left alone, desktop
+  notification. It never re-injects more than once per run.
+- Overwolf refreshes its games list from its CDN every week or two, and the fresh copy drops the
+  `<OOPO>True</OOPO>` patch. `prepare` re-patches the newest list after Overwolf has started (restarting
+  Overwolf once, before READY) and every re-attach patches it again. If a run still starts without OOPO
+  (`alecaframe doctor` and `check-data` say so), the watchdog stops Overwolf instead of re-attaching: without
+  OOPO the overlay runs inside the game (stutter, frozen controls), and a second injection into that game
+  crashed it in testing (2026-10-18). Quit the game and start again with `alecaframe warframe`.
 - Dragging AlecaFrame's window may make it jump (Overwolf native drag under Wine).
 - Only the 64-bit `ntdll.dll` is patched. The prebuilt DLL matches UMU-Proton-10.0-4 exactly.
 - `--standalone` (DE's installer instead of a Steam copy) and the Steam-prefix mode of the tool are
