@@ -10,6 +10,7 @@ NEUTER_REMOTE_DISABLE="0"                             # 1 = override Overwolf's 
 OVERLAY_KILL_WHEN_LOADED="1"                          # kill ow-overlay.exe once the scanner is attached (input-grab fix)
 REATTACH_AFTER="75"                                   # seconds of game time without scanner before the one auto re-attach
 GIVEUP_AFTER="300"                                    # seconds of game time without data before the overlay is stopped for good
+TRIM_MEMORY="1"                                       # keep Overwolf under its 900 MiB self-restart by reclaiming cold pages
 # Experimental: run against Steam's own Warframe instead (launch option STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%)
 # INJECT_MODE="steam"
 # STEAM_APPID="230410"

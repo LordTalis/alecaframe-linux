@@ -30,6 +30,9 @@ NEUTER_REMOTE_DISABLE="0"      # 1 = rewrite Overwolf's overlay_disabled_games.j
 OVERLAY_KILL_WHEN_LOADED="1"   # once the scanner has attached, kill Overwolf's overlay process (it can freeze game input)
 REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf (once)
 GIVEUP_AFTER="300"             # seconds of game uptime without captured data before the watchdog kills the overlay and stops
+TRIM_MEMORY="1"                # 1 = keep Overwolf under its 900 MiB self-restart ("Time for a break") by reclaiming cold pages
+TRIM_ABOVE_MB="750"            # trim when the Overwolf client's resident memory is above this
+TRIM_TO_MB="550"               # ...aiming for about this
 INJECT_MODE="umu"              # umu = re-enter the umu-run container; steam = Valve launcher service (experimental)
 STEAM_APPID="230410"
 SLR_LAUNCH_CLIENT=""
@@ -416,6 +419,59 @@ inventory_ready() {   # true once AlecaFrame has captured the inventory this ses
     grep -a -q 'New inventory data' $logs 2>/dev/null                                   # the game and lose the data.
 }
 
+# ---------- memory trim: the Linux stand-in for Windows' EmptyWorkingSet ----------
+# Overwolf restarts itself ("Time for a break", OverWolf.Client.BL MemoryTracker) once its private working set reaches
+# 900 MiB, even mid-game, and re-injects into the game when it comes back. On Windows it stays below that by calling
+# EmptyWorkingSet at 500 MiB; Wine implements EmptyWorkingSet as a no-op, so here the number only grows (about 32 MB
+# a minute while the killed overlay leaves Overwolf leaking a thread every 5 s). Overwolf's reading is its resident
+# memory, so: put the Overwolf processes in their own systemd scope the moment they start, and have the watchdog ask
+# the kernel to reclaim that scope's cold pages. Memory stays charged to the cgroup it was allocated in, which is why
+# adoption has to happen at startup, and why the tool never reclaims from any cgroup it did not create (the game's).
+OW_SCOPE_FILE="$LOGDIR/overwolf-scope"
+TRIM_LOCK="$LOGDIR/trim.pid"
+ow_client_pid() { ps -eo pid,comm 2>/dev/null | awk '$2 ~ /^(OverwolfLaunche|Overwolf\.exe)/ {print $1; exit}'; }
+adopt_overwolf() {   # background, ~60 s: move each new Overwolf client process into one transient user scope
+    [ "$TRIM_MEMORY" = "1" ] && command -v busctl >/dev/null || return 0
+    local unit; unit="alecaframe-overwolf-$(date +%s).scope"
+    echo "$unit" > "$OW_SCOPE_FILE"
+    (
+        declare -A seen; local p created=0 end=$(( $(date +%s) + 60 ))
+        for p in $(ps -eo pid,comm | awk '$2 ~ /^(OverwolfLaunche|Overwolf\.exe)/ {print $1}'); do seen[$p]=1; done
+        while [ "$(date +%s)" -lt "$end" ]; do
+            for p in $(ps -eo pid,comm | awk '$2 ~ /^(OverwolfLaunche|Overwolf\.exe)/ {print $1}'); do
+                [ -n "${seen[$p]:-}" ] && continue; seen[$p]=1
+                if [ "$created" -eq 0 ]; then
+                    busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+                        StartTransientUnit 'ssa(sv)a(sa(sv))' "$unit" fail 2 PIDs au 1 "$p" Slice s app.slice 0 >/dev/null 2>&1 && created=1
+                else
+                    busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager \
+                        AttachProcessesToUnit 'ssau' "$unit" / 1 "$p" >/dev/null 2>&1
+                fi
+            done
+            sleep 0.1
+        done
+        [ "$created" -eq 1 ] && echo "$(date +%H:%M:%S) Overwolf adopted into $unit (memory trim armed)"
+    ) </dev/null >>"$LOG" 2>&1 &
+}
+trim_overwolf() {   # reclaim cold pages from Overwolf's own scope when the client nears Overwolf's 900 MiB limit
+    [ "$TRIM_MEMORY" = "1" ] || return 0
+    local p cg rss amt
+    p=$(ow_client_pid); [ -n "$p" ] || return 0
+    cg="/sys/fs/cgroup$(cut -d: -f3 "/proc/$p/cgroup" 2>/dev/null)"
+    case "$cg" in */alecaframe-overwolf-*.scope) ;; *) return 0 ;; esac
+    [ -w "$cg/memory.reclaim" ] || return 0
+    rss=$(( $(ps -o rss= -p "$p" 2>/dev/null || echo 0) / 1024 ))
+    [ "$rss" -gt "$TRIM_ABOVE_MB" ] || return 0
+    [ -f "$TRIM_LOCK" ] && kill -0 "$(cat "$TRIM_LOCK" 2>/dev/null)" 2>/dev/null && return 0
+    amt=$(( (rss - TRIM_TO_MB) * 3 )); [ "$amt" -gt 2048 ] && amt=2048   # scope-wide reclaim; ~1/3 lands on the client
+    (
+        echo "$BASHPID" > "$TRIM_LOCK"
+        echo "${amt}M" > "$cg/memory.reclaim" 2>/dev/null
+        echo "$(date +%H:%M:%S) trimmed Overwolf: client ${rss} MB -> $(( $(ps -o rss= -p "$p" 2>/dev/null || echo 0) / 1024 )) MB (asked ${amt} MB of its scope)"
+        rm -f "$TRIM_LOCK"
+    ) </dev/null >>"$LOG" 2>&1 &
+}
+
 # ---------- injection into the running launcher container ----------
 inject() {
     if [ "$INJECT_MODE" = "steam" ]; then
@@ -458,6 +514,7 @@ overlay_reaper_loop() {
         reap_dead_overlays
         contain_overlay_windows
         tick=$((tick+1))
+        [ $((tick % 15)) -eq 0 ] && trim_overwolf
         game_running || { reattached=0; gave_up=0; }
         if [ $((tick % 2)) -eq 0 ] && [ "$gave_up" -eq 0 ] && game_running; then
             age=$(game_age); started=$(( $(date +%s) - age ))
@@ -536,7 +593,7 @@ do_reattach() {   # restart ONLY Overwolf+AlecaFrame while the game keeps runnin
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
     t0=$(date +%s)
-    inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+    adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
     i=0
     while [ "$i" -lt 180 ]; do
         gep_loaded && { echo "Data scanner: LOADED after ${i}s."; return 0; }
@@ -574,7 +631,7 @@ do_prepare() {
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
     echo "Starting Overwolf + AlecaFrame (single launch)..."
-    inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+    adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
     local i=0 ow_up=0
     while [ "$i" -lt 90 ]; do overwolf_running && { ow_up=1; break; }; i=$((i+1)); sleep 1; done
     [ "$ow_up" -eq 1 ] || { echo "Overwolf did not start. See $LOG"; return 1; }
@@ -596,7 +653,7 @@ do_prepare() {
             stop_overlay_reaper; stop_overwolf
             apply_oopo_mode
             : > "$AF_BGLOG" 2>/dev/null || true
-            inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
+            adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
             i=0; while [ "$i" -lt 90 ]; do overwolf_running && break; i=$((i+1)); sleep 1; done
             start_overlay_reaper
             if ! wait_for_init 120 || ! oopo_ok; then
@@ -691,6 +748,7 @@ case "${1:-}" in
         game_running && echo "Warframe game:     RUNNING (Warframe.x64.exe, up $(game_age)s)" || echo "Warframe game:     not running"
         overwolf_running && echo "Overwolf:          RUNNING" || echo "Overwolf:          not running"
         if overwolf_running; then gep_loaded && echo "Data scanner:      LOADED" || echo "Data scanner:      not loaded (yet)"; fi
+        p=$(ow_client_pid); [ -n "$p" ] && echo "Overwolf memory:   $(( $(ps -o rss= -p "$p" 2>/dev/null || echo 0) / 1024 )) MB resident (self-restarts at 900 MiB), $(ls /proc/"$p"/task 2>/dev/null | wc -l) threads, cgroup $(cut -d: -f3 /proc/"$p"/cgroup 2>/dev/null | sed 's#.*/##')"
         [ -f "$REAPER_PIDFILE" ] && kill -0 "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null && echo "Overlay containment: ARMED"
         echo "Profile: $CONF"; echo "  WINEPREFIX=$WINEPREFIX"; echo "  PROTONPATH=$PROTONPATH"; echo "  LAUNCHER=$(resolve_launcher)"
         echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)" ;;
@@ -713,7 +771,7 @@ case "${1:-}" in
         echo "--- events provider"; [ -f "$GEP_LOG" ] && tail -n 10 "$GEP_LOG" | cut -c1-200
         echo "--- launcher/containment"; tail -n 10 "$LOG" 2>/dev/null ;;
     profile)
-        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER GIVEUP_AFTER INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
+        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER GIVEUP_AFTER TRIM_MEMORY TRIM_ABOVE_MB TRIM_TO_MB INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
         echo "launcher resolves to: $(resolve_launcher)" ;;
     doctor)
         ok() { echo "  [ok]   $*"; }; bad() { echo "  [!!]   $*"; }
@@ -734,7 +792,15 @@ case "${1:-}" in
             gep_oopo_off && bad "last provider session ran WITHOUT OOPO (oopOverlay=false): no live data that run"
         fi
         [ -f "$(resolve_launcher)" ] && ok "launcher: $(resolve_launcher)" || bad "launcher not found: $(resolve_launcher)"
-        [ -d "$GAME_DIR/Public" ] && ok "game content: $GAME_DIR/Public" || bad "game content dir missing: $GAME_DIR/Public" ;;
+        [ -d "$GAME_DIR/Public" ] && ok "game content: $GAME_DIR/Public" || bad "game content dir missing: $GAME_DIR/Public"
+        if [ "$TRIM_MEMORY" = "1" ]; then
+            ucg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service"
+            if ! command -v busctl >/dev/null; then bad "busctl missing: Overwolf memory trim disabled (it may restart itself at 900 MiB)"
+            elif ! grep -qw memory "$ucg/cgroup.controllers" 2>/dev/null; then bad "memory cgroup controller not delegated to your user session: Overwolf memory trim disabled"
+            elif [ ! -e "$ucg/app.slice/memory.reclaim" ]; then bad "no memory.reclaim in your user session's cgroups (needs Linux 5.19+): Overwolf memory trim disabled"
+            else ok "Overwolf memory trim available (user scope + memory.reclaim)"; fi
+            [ "$(awk 'NR>1' /proc/swaps | wc -l)" -gt 0 ] && ok "swap present (trimmed Overwolf pages need somewhere to go)" || bad "no swap: the memory trim can only drop file pages"
+        fi ;;
     install-kwin-rules)
         command -v kwriteconfig6 >/dev/null || { echo "kwriteconfig6 not found (KDE Plasma 6 only)"; exit 1; }
         RC="$HOME/.config/kwinrulesrc"

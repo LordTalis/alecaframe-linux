@@ -133,6 +133,14 @@ If you want no memory reading at all, use [TennoScope](https://github.com/Defter
   (`alecaframe doctor` and `check-data` say so), the watchdog stops Overwolf instead of re-attaching: without
   OOPO the overlay runs inside the game (stutter, frozen controls), and a second injection into that game
   crashed it in testing (2026-10-18). Quit the game and start again with `alecaframe warframe`.
+- Overwolf restarts itself ("Time for a break") once its own memory reaches 900 MiB, even mid-game, and
+  re-injects into the game when it comes back. On Windows it stays under that by calling `EmptyWorkingSet`;
+  Wine implements that as a no-op, so under Wine Overwolf idles at about 890 MB. It also leaks a thread every
+  5 s (about 32 MB a minute) after its overlay process is killed. The tool puts Overwolf in its own systemd
+  user scope as it starts and has the watchdog reclaim that scope's cold pages above 750 MB
+  (`TRIM_MEMORY`, `TRIM_ABOVE_MB`, `TRIM_TO_MB`). It never reclaims from any cgroup it did not create, so the
+  game is never touched. Needs a systemd user session with the memory controller delegated (the default on
+  Fedora/Nobara), Linux 5.19+ (`memory.reclaim`) and some swap. `alecaframe doctor` checks all three.
 - Dragging AlecaFrame's window may make it jump (Overwolf native drag under Wine).
 - Only the 64-bit `ntdll.dll` is patched. The prebuilt DLL matches UMU-Proton-10.0-4 exactly.
 - `--standalone` (DE's installer instead of a Steam copy) and the Steam-prefix mode of the tool are
