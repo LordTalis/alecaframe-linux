@@ -537,7 +537,7 @@ reap_dead_overlays() {
 overlay_reaper_loop() {
     # Per game run: at most ONE re-attach, then give up. Every re-attach injects Overwolf into the live game again; on
     # 2026-10-18 the second one in a session killed it (exit 0xC0000409), so never loop on it.
-    local misses=0 tick=0 reattached=0 gave_up=0 age started
+    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning
     while :; do
         reap_dead_overlays
         contain_overlay_windows
@@ -546,6 +546,10 @@ overlay_reaper_loop() {
         game_running || { reattached=0; gave_up=0; }
         if [ $((tick % 2)) -eq 0 ] && [ "$gave_up" -eq 0 ] && game_running; then
             age=$(game_age); started=$(( $(date +%s) - age ))
+            # scanning time = seconds since the CURRENT provider session started (a re-attach restarts the scan, so the
+            # give-up clock restarts with it). On 2026-10-22 a re-attach 6 min into the game was "given up" after 20 s
+            # because the clock counted from game start: the overlay was killed mid-scan and no inventory was captured.
+            scan_t0=$(gep_session_start); [ "$scan_t0" -gt "$started" ] && scanning=$(( $(date +%s) - scan_t0 )) || scanning=$age
             if [ "$OOPO_MODE" = "on" ] && gep_written_since "$started" && gep_oopo_off; then
                 # Overwolf loaded a games list without OOPO: no data this run, the overlay runs inside the game and
                 # stutters/freezes it, and re-injecting can crash it. Stopping Overwolf is safe for the game; patch the
@@ -558,10 +562,10 @@ overlay_reaper_loop() {
             elif gep_loaded && inventory_ready; then
                 # inventory captured: safe to free input by killing the overlay (the data was cached and persists).
                 [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ] && kill_overlays
-            elif ! inventory_ready && [ "$age" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; }; then
-                # still nothing captured this long into the game: stop holding the overlay (input grab, CPU) and stop
-                # trying. AlecaFrame's desktop window keeps the last cached data.
-                echo "$(date +%H:%M:%S) no inventory after ${age}s of game time; giving up for this run" >> "$LOG"
+            elif ! inventory_ready && [ "$scanning" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; }; then
+                # still nothing captured this long after the scanner started: stop holding the overlay (input grab, CPU)
+                # and stop trying. AlecaFrame's desktop window keeps the last cached data.
+                echo "$(date +%H:%M:%S) no inventory after ${scanning}s of scanning (game up ${age}s); giving up for this run" >> "$LOG"
                 kill_overlays "giving up: no inventory captured"
                 notify_fail "AlecaFrame did not get live data this session. The overlay was stopped so your controls stay free; the game was left alone. Next time: 'alecaframe stop', then start with 'alecaframe warframe'."
                 gave_up=1
