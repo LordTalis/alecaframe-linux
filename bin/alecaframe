@@ -107,6 +107,9 @@ wait_for_container() {   # wait (default 600 s) until the container is ready; ex
     echo "$(date +%H:%M:%S) the launcher's container never became ready in ${secs}s (umu runtime update stuck?). See $LOG"
     return 1
 }
+ATTACH_FILE="$LOGDIR/attach-epoch"   # written at every Overwolf (re)launch; the reaper ignores provider sessions older than it
+mark_attach() { date +%s > "$ATTACH_FILE" 2>/dev/null || true; }
+attach_epoch() { cat "$ATTACH_FILE" 2>/dev/null || echo 0; }
 pv_errors() {   # count of pressure-vessel "Cannot create temporary directory" failures in the launch log so far
     local n; n=$(grep -c 'Cannot create temporary directory' "$LOG" 2>/dev/null); echo "${n:-0}"
 }
@@ -502,6 +505,7 @@ trim_overwolf() {   # reclaim cold pages from Overwolf's own scope when the clie
 
 # ---------- injection into the running launcher container ----------
 inject() {
+    mark_attach
     if [ "$INJECT_MODE" = "steam" ]; then
         local exe="$1"; shift
         setsid nohup "$SLR_LAUNCH_CLIENT" --bus-name="com.steampowered.App$STEAM_APPID" --directory="$(dirname "$exe")" \
@@ -537,7 +541,7 @@ reap_dead_overlays() {
 overlay_reaper_loop() {
     # Per game run: at most ONE re-attach, then give up. Every re-attach injects Overwolf into the live game again; on
     # 2026-10-18 the second one in a session killed it (exit 0xC0000409), so never loop on it.
-    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning
+    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning att stale_gep
     while :; do
         reap_dead_overlays
         contain_overlay_windows
@@ -549,8 +553,18 @@ overlay_reaper_loop() {
             # scanning time = seconds since the CURRENT provider session started (a re-attach restarts the scan, so the
             # give-up clock restarts with it). On 2026-10-22 a re-attach 6 min into the game was "given up" after 20 s
             # because the clock counted from game start: the overlay was killed mid-scan and no inventory was captured.
-            scan_t0=$(gep_session_start); [ "$scan_t0" -gt "$started" ] && scanning=$(( $(date +%s) - scan_t0 )) || scanning=$age
-            if [ "$OOPO_MODE" = "on" ] && gep_written_since "$started" && gep_oopo_off; then
+            scan_t0=$(gep_session_start); att=$(attach_epoch)
+            if [ "$att" -gt "$scan_t0" ]; then
+                # Overwolf was (re)launched after the provider session in the log: that log is the PREVIOUS session. Nothing
+                # it says (loaded, oopo off, age) applies yet; wait for the new provider to write. (2026-10-22: a reattach
+                # was "given up" 2 s in, reading the old session.)
+                scanning=0; stale_gep=1
+            else
+                stale_gep=0; [ "$scan_t0" -gt "$started" ] && scanning=$(( $(date +%s) - scan_t0 )) || scanning=$age
+            fi
+            if [ "$stale_gep" -eq 1 ]; then
+                :   # provider not up yet for this attach
+            elif [ "$OOPO_MODE" = "on" ] && gep_written_since "$started" && gep_oopo_off; then
                 # Overwolf loaded a games list without OOPO: no data this run, the overlay runs inside the game and
                 # stutters/freezes it, and re-injecting can crash it. Stopping Overwolf is safe for the game; patch the
                 # list for the next launch and tell the user instead of re-attaching.
