@@ -82,6 +82,34 @@ launcher_container_up() {
         ps -eo args 2>/dev/null | grep -E 'umu-run.*Launcher\.exe' | grep -qv grep
     fi
 }
+# umu's own state: it installs/updates its Steam Linux Runtime (steamrt3 for Proton 10) on the FIRST launch while holding
+# umu.lock, REPLACING the runtime directory. An inject during that window dies in pressure-vessel ("Cannot create
+# temporary directory .../steamrt3/var/tmp-*") and Overwolf never starts. Re-entry also needs the container's launcher
+# service to own its session-bus name (com.steampowered.App<md5>). Both are checked before every inject.
+UMU_LOCAL="${UMU_FOLDERS_PATH:+$UMU_FOLDERS_PATH/umu}"; UMU_LOCAL="${UMU_LOCAL:-${XDG_DATA_HOME:-$HOME/.local/share}/umu}"
+UMU_RUNTIME="${UMU_RUNTIME:-steamrt3}"
+umu_container_ready() {
+    [ "$INJECT_MODE" = "steam" ] && return 0
+    [ -f "$UMU_LOCAL/$UMU_RUNTIME/.installed.ok" ] || return 1
+    if command -v flock >/dev/null; then flock -n "$UMU_LOCAL/umu.lock" true 2>/dev/null || return 1; fi
+    command -v busctl >/dev/null || return 0
+    busctl --user list --acquired --no-pager 2>/dev/null | grep -qE '^com\.steampowered\.App[0-9a-f]{32} '
+}
+wait_for_container() {   # wait (default 600 s) until the container is ready; explains itself after 10 s, then every minute
+    local secs="${1:-600}" i=0
+    while [ "$i" -lt "$secs" ]; do
+        umu_container_ready && return 0
+        if [ "$i" -eq 10 ] || { [ "$i" -gt 10 ] && [ $((i % 60)) -eq 0 ]; }; then
+            echo "$(date +%H:%M:%S) umu is still installing/updating its runtime, or the launcher's container is not up yet; waiting (${i}s)..."
+        fi
+        i=$((i+2)); sleep 2
+    done
+    echo "$(date +%H:%M:%S) the launcher's container never became ready in ${secs}s (umu runtime update stuck?). See $LOG"
+    return 1
+}
+pv_errors() {   # count of pressure-vessel "Cannot create temporary directory" failures in the launch log so far
+    local n; n=$(grep -c 'Cannot create temporary directory' "$LOG" 2>/dev/null); echo "${n:-0}"
+}
 game_running()     { ps -eo comm 2>/dev/null | grep -q '^Warframe.x64'; }
 overwolf_running() { ps -eo comm 2>/dev/null | grep -q -i '^OverwolfBrowser'; }
 game_age() {   # seconds since Warframe.x64.exe started (0 if not running)
@@ -592,11 +620,18 @@ do_reattach() {   # restart ONLY Overwolf+AlecaFrame while the game keeps runnin
     fi
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
+    wait_for_container 600 || return 1
     t0=$(date +%s)
+    local pv0 retried=0; pv0=$(pv_errors)
     adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
     i=0
     while [ "$i" -lt 180 ]; do
         gep_loaded && { echo "Data scanner: LOADED after ${i}s."; return 0; }
+        if [ "$retried" -eq 0 ] && [ "$(pv_errors)" -gt "$pv0" ]; then
+            retried=1; echo "  (the inject ran into umu's runtime update; waiting for it, then launching once more)"
+            wait_for_container 600 || return 1
+            pv0=$(pv_errors); t0=$(date +%s); i=0; adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"; continue
+        fi
         if [ "$OOPO_MODE" = "on" ] && [ "$(gep_session_start)" -ge "$t0" ] && gep_oopo_off; then
             echo "Provider started WITHOUT OOPO (oopOverlay=false); the scanner cannot attach this run. See: alecaframe doctor"
             return 1
@@ -630,10 +665,20 @@ do_prepare() {
     ensure_manifest_patches
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
+    wait_for_container 600 || return 1
     echo "Starting Overwolf + AlecaFrame (single launch)..."
+    local i=0 ow_up=0 pv0 retried=0; pv0=$(pv_errors)
     adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"
-    local i=0 ow_up=0
-    while [ "$i" -lt 90 ]; do overwolf_running && { ow_up=1; break; }; i=$((i+1)); sleep 1; done
+    while [ "$i" -lt 90 ]; do
+        overwolf_running && { ow_up=1; break; }
+        if [ "$retried" -eq 0 ] && [ "$(pv_errors)" -gt "$pv0" ]; then
+            # the inject landed while umu was still replacing its runtime (first launch after a runtime release)
+            retried=1; echo "  (the inject ran into umu's runtime update; waiting for it, then launching once more)"
+            wait_for_container 600 || return 1
+            pv0=$(pv_errors); i=0; adopt_overwolf; inject "$OW_LAUNCHER" -launchapp "$AF_EXTID"; continue
+        fi
+        i=$((i+1)); sleep 1
+    done
     [ "$ow_up" -eq 1 ] || { echo "Overwolf did not start. See $LOG"; return 1; }
     start_overlay_reaper
     echo "Waiting for AlecaFrame to start..."
@@ -759,7 +804,11 @@ case "${1:-}" in
         i=0
         while [ "$i" -lt 180 ]; do
             game_running && { echo "[alecaframe] game already running; re-attaching." >&2; do_prepare; exit $?; }
-            if launcher_container_up; then sleep 5; do_prepare; exit $?; fi
+            if launcher_container_up; then
+                # umu-run is up, but its container may still be minutes away (runtime download/update on first launch)
+                wait_for_container 600 || { echo "[alecaframe] giving up: the launcher's container never became ready. Try: alecaframe prepare" >&2; exit 1; }
+                sleep 3; do_prepare; exit $?
+            fi
             i=$((i+1)); sleep 1
         done
         exit 0 ;;
@@ -776,6 +825,10 @@ case "${1:-}" in
     doctor)
         ok() { echo "  [ok]   $*"; }; bad() { echo "  [!!]   $*"; }
         command -v umu-run >/dev/null && ok "umu-run $(umu-run --version 2>/dev/null | head -1)" || bad "umu-run not found (install umu-launcher)"
+        if [ -f "$UMU_LOCAL/$UMU_RUNTIME/VERSIONS.txt" ]; then
+            if flock -n "$UMU_LOCAL/umu.lock" true 2>/dev/null; then ok "umu runtime $UMU_RUNTIME $(awk -F'\t' '$1=="depot"{print $2}' "$UMU_LOCAL/$UMU_RUNTIME/VERSIONS.txt") (not updating)"
+            else bad "umu is updating its runtime $UMU_RUNTIME right now; 'alecaframe prepare' waits for it (up to 10 min)"; fi
+        else bad "umu runtime $UMU_RUNTIME not installed yet under $UMU_LOCAL (the first 'alecaframe warframe' downloads it; prepare waits)"; fi
         for t in python3 curl xdotool wmctrl; do command -v $t >/dev/null && ok "$t" || bad "$t missing$( [ "$t" = xdotool ] || [ "$t" = wmctrl ] && echo ' (optional: overlay window containment)')"; done
         ps=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "?")
         if [ "$ps" = "0" ]; then ok "kernel.yama.ptrace_scope=0 (Wine's ReadProcessMemory between sibling processes works)"; else bad "kernel.yama.ptrace_scope=$ps: the data scanner may read nothing. Fedora/Nobara ship 0; Ubuntu/Arch ship 1. To change (needs root): sudo sysctl kernel.yama.ptrace_scope=0 (persist in /etc/sysctl.d/). This lowers a system-wide hardening knob; see README."; fi

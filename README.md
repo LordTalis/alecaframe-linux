@@ -76,6 +76,13 @@ alecaframe install-launcher   # add a "Warframe + AlecaFrame" entry to your app 
 NO_ALECA=1 alecaframe warframe   # game only
 ```
 
+If `autostart.log` says `Overwolf did not start` and `overwolf-launch.log` has
+`pressure-vessel-wrap: Cannot create temporary directory .../umu/steamrt3/var/tmp-...`, umu was still
+downloading/replacing its Steam Linux Runtime (it does that on the first launch after a runtime release, holding
+`umu.lock`) when Overwolf was injected. The tool now waits for that (up to 10 minutes; `alecaframe doctor` shows
+the runtime version and whether an update is running) and retries the launch once if it hits the error anyway.
+On an older build: wait a minute, then `alecaframe reattach`.
+
 ## How it works, in one paragraph
 
 Warframe runs through umu-launcher + Proton inside Valve's pressure-vessel container. `alecaframe prepare`
