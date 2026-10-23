@@ -110,6 +110,10 @@ wait_for_container() {   # wait (default 600 s) until the container is ready; ex
 ATTACH_FILE="$LOGDIR/attach-epoch"   # written at every Overwolf (re)launch; the reaper ignores provider sessions older than it
 mark_attach() { date +%s > "$ATTACH_FILE" 2>/dev/null || true; }
 attach_epoch() { cat "$ATTACH_FILE" 2>/dev/null || echo 0; }
+reaper_alive() {   # a live reaper process; a zombie (parent never waited) still answers kill -0, so read its state
+    local p s; p=$(cat "$REAPER_PIDFILE" 2>/dev/null); [ -n "$p" ] || return 1
+    s=$(awk '{print $3}' /proc/"$p"/stat 2>/dev/null); [ -n "$s" ] && [ "$s" != "Z" ]
+}
 pv_errors() {   # count of pressure-vessel "Cannot create temporary directory" failures in the launch log so far
     local n; n=$(grep -c 'Cannot create temporary directory' "$LOG" 2>/dev/null); echo "${n:-0}"
 }
@@ -428,6 +432,8 @@ ensure_data_cache() {
 # ---------- data scanner state ----------
 gep_loaded() {   # scanner attached in the CURRENT provider session (each start logs "Game Service Initialized")
     [ -f "$GEP_LOG" ] || return 1
+    # Overwolf does not reset this log when it restarts: a session that predates our last launch is the previous run
+    [ "$(gep_session_start)" -ge "$(attach_epoch)" ] || return 1
     awk '/Game Service Initialized|==== *new session/ { buf=""; next } { buf=buf $0 ORS }
          END { if (buf ~ /Warframe plugin loaded:.*success/ || buf ~ /detected renderer: D3D/) exit 0; else exit 1 }' "$GEP_LOG" 2>/dev/null
 }
@@ -600,7 +606,7 @@ overlay_reaper_loop() {
     rm -f "$REAPER_PIDFILE"
 }
 start_overlay_reaper() {
-    if [ -f "$REAPER_PIDFILE" ] && kill -0 "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null; then return 0; fi
+    reaper_alive && return 0
     setsid "$0" reap </dev/null >>"$LOG" 2>&1 &
     echo "  (overlay containment armed)"
 }
@@ -638,6 +644,7 @@ do_reattach() {   # restart ONLY Overwolf+AlecaFrame while the game keeps runnin
     fi
     ensure_data_cache
     : > "$AF_BGLOG" 2>/dev/null || true
+    : > "$GEP_LOG" 2>/dev/null || true    # Overwolf is stopped: drop the previous provider session so nothing reads it as "LOADED"
     wait_for_container 600 || return 1
     t0=$(date +%s)
     local pv0 retried=0; pv0=$(pv_errors)
@@ -812,7 +819,7 @@ case "${1:-}" in
         overwolf_running && echo "Overwolf:          RUNNING" || echo "Overwolf:          not running"
         if overwolf_running; then gep_loaded && echo "Data scanner:      LOADED" || echo "Data scanner:      not loaded (yet)"; fi
         p=$(ow_client_pid); [ -n "$p" ] && echo "Overwolf memory:   $(( $(ps -o rss= -p "$p" 2>/dev/null || echo 0) / 1024 )) MB resident (self-restarts at 900 MiB), $(ls /proc/"$p"/task 2>/dev/null | wc -l) threads, cgroup $(cut -d: -f3 /proc/"$p"/cgroup 2>/dev/null | sed 's#.*/##')"
-        [ -f "$REAPER_PIDFILE" ] && kill -0 "$(cat "$REAPER_PIDFILE" 2>/dev/null)" 2>/dev/null && echo "Overlay containment: ARMED"
+        reaper_alive && echo "Overlay containment: ARMED"
         echo "Profile: $CONF"; echo "  WINEPREFIX=$WINEPREFIX"; echo "  PROTONPATH=$PROTONPATH"; echo "  LAUNCHER=$(resolve_launcher)"
         echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)" ;;
     wait-prepare)
