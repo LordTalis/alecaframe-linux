@@ -28,6 +28,9 @@ AF_EXTID="afmcagbpgggkpdkokjhjkllpegnadmkignlonpjm"
 OOPO_MODE="on"                 # on = live data on DXVK (overlay injects, renderer detected); off = stale data
 NEUTER_REMOTE_DISABLE="0"      # 1 = rewrite Overwolf's overlay_disabled_games.json entry for Warframe (normally unnecessary)
 OVERLAY_KILL_WHEN_LOADED="1"   # once the scanner has attached, kill Overwolf's overlay process (it can freeze game input)
+OVERLAY_KILL_MAX="1"           # ...at most this many times per scanner session. Overwolf relaunches the overlay after a kill;
+                               # killing it again and again (3x in 5 s on 2026-10-27) makes Overwolf decide the GAME quit:
+                               # it closes the data feed and its client spins at 70% CPU (AlecaFrame window frozen). 0 = never kill.
 REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf (once)
 GIVEUP_AFTER="300"             # seconds of game uptime without captured data before the watchdog kills the overlay and stops
 TRIM_MEMORY="1"                # 1 = keep Overwolf under its 900 MiB self-restart ("Time for a break") by reclaiming cold pages
@@ -531,10 +534,23 @@ contain_overlay_windows() {
     done
 }
 kill_overlays() {   # the overlay process is only needed until the scanner has attached; afterwards it can hog CPU and
-    local p why="${1:-scanner already attached}"   # install a global input hook that freezes the game's controls.
+    local p n=0 why="${1:-scanner already attached}"   # install a global input hook that freezes the game's controls.
     for p in $(ps -eo pid,comm | awk '$2 ~ /^ow-overlay/ {print $1}'); do      # Data keeps flowing after killing it.
-        kill -TERM "$p" 2>/dev/null && echo "$(date +%H:%M:%S) killed ow-overlay pid=$p ($why)" >> "$LOG"
+        kill -TERM "$p" 2>/dev/null && { n=$((n+1)); echo "$(date +%H:%M:%S) killed ow-overlay pid=$p ($why)" >> "$LOG"; }
     done
+    [ "$n" -gt 0 ]   # true when something was killed (the reaper counts kill rounds per scanner session)
+}
+ow_trace_log() { ls -t "$OW_APPDATA"/Log/Trace_*.log 2>/dev/null | head -1; }
+ow_thinks_game_quit() {   # Overwolf's current trace says the game's last state is Quit while Warframe.x64.exe is alive.
+    # Seen 2026-10-27: after the overlay process was killed 3x in 5 s, OverlayService logged "Process exit: Warframe.x64.exe"
+    # for the live game -> GamesManager State: Quit -> events provider closed ("No game for 10 seconds") -> no live data
+    # for the rest of the run, and the Overwolf client spun at ~70% CPU (AlecaFrame window unresponsive).
+    game_running || return 1
+    local t; t=$(ow_trace_log); [ -n "$t" ] || return 1
+    [ "$(grep -a 'Process state changed invoked on game: Warframe' "$t" 2>/dev/null | tail -1 | grep -o 'State: [A-Za-z]*')" = "State: Quit" ]
+}
+ow_client_cpu() {   # the Overwolf client's CPU use since it started, in percent (ps average; a healthy idle client is <10)
+    local p; p=$(ow_client_pid); [ -n "$p" ] && ps -o pcpu= -p "$p" 2>/dev/null | tr -d ' ' || echo 0
 }
 reap_dead_overlays() {
     # NOTE: Overwolf's --game-pid is a *Windows* PID and cannot be checked against Linux /proc.
@@ -547,13 +563,20 @@ reap_dead_overlays() {
 overlay_reaper_loop() {
     # Per game run: at most ONE re-attach, then give up. Every re-attach injects Overwolf into the live game again; on
     # 2026-10-18 the second one in a session killed it (exit 0xC0000409), so never loop on it.
-    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning att stale_gep
+    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning att stale_gep kills=0 kill_sess=0 quit_warned=0
     while :; do
         reap_dead_overlays
         contain_overlay_windows
         tick=$((tick+1))
         [ $((tick % 15)) -eq 0 ] && trim_overwolf
-        game_running || { reattached=0; gave_up=0; }
+        game_running || { reattached=0; gave_up=0; kills=0; kill_sess=0; quit_warned=0; }
+        if [ $((tick % 10)) -eq 0 ] && [ "$quit_warned" -eq 0 ] && ow_thinks_game_quit; then
+            # Overwolf dropped the live game (overlay kill misread as the game exiting): the feed is closed for this run
+            # and its client may spin. Nothing to re-inject here (the game is fine); tell the user once and leave it.
+            echo "$(date +%H:%M:%S) Overwolf logged the game as QUIT while Warframe.x64.exe is running (overlay kill misdetect): live data is over for this run; Overwolf client at $(ow_client_cpu)% CPU" >> "$LOG"
+            notify_fail "Overwolf thinks the game has quit, so live data stopped for this run (your inventory captured earlier is kept). If the AlecaFrame window hangs: 'alecaframe stop' (the game is left alone), and set OVERLAY_KILL_MAX=0 in the profile."
+            quit_warned=1
+        fi
         if [ $((tick % 2)) -eq 0 ] && [ "$gave_up" -eq 0 ] && game_running; then
             age=$(game_age); started=$(( $(date +%s) - age ))
             # scanning time = seconds since the CURRENT provider session started (a re-attach restarts the scan, so the
@@ -580,8 +603,13 @@ overlay_reaper_loop() {
                 notify_fail "Overwolf loaded a games list without the Linux fix, so it could not read this game session. Overwolf was stopped so the game stays smooth. The fix is re-applied: quit Warframe and start it again with 'alecaframe warframe'."
                 gave_up=1
             elif gep_loaded && inventory_ready; then
-                # inventory captured: safe to free input by killing the overlay (the data was cached and persists).
-                [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ] && kill_overlays
+                # inventory captured: safe to free input by killing the overlay (the data was cached and persists)...
+                # but only OVERLAY_KILL_MAX times per scanner session. Overwolf relaunches the overlay after each kill and
+                # on 2026-10-27 the third kill in 5 s made it log the live game as "Quit" (feed closed, client spinning).
+                if [ "$OVERLAY_KILL_WHEN_LOADED" = "1" ]; then
+                    [ "$kill_sess" != "$scan_t0" ] && { kills=0; kill_sess=$scan_t0; }
+                    if [ "$kills" -lt "${OVERLAY_KILL_MAX:-1}" ]; then kill_overlays && kills=$((kills+1)); fi
+                fi
             elif ! inventory_ready && [ "$scanning" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; }; then
                 # still nothing captured this long after the scanner started: stop holding the overlay (input grab, CPU)
                 # and stop trying. AlecaFrame's desktop window keeps the last cached data.
@@ -819,6 +847,8 @@ case "${1:-}" in
         overwolf_running && echo "Overwolf:          RUNNING" || echo "Overwolf:          not running"
         if overwolf_running; then gep_loaded && echo "Data scanner:      LOADED" || echo "Data scanner:      not loaded (yet)"; fi
         p=$(ow_client_pid); [ -n "$p" ] && echo "Overwolf memory:   $(( $(ps -o rss= -p "$p" 2>/dev/null || echo 0) / 1024 )) MB resident (self-restarts at 900 MiB), $(ls /proc/"$p"/task 2>/dev/null | wc -l) threads, cgroup $(cut -d: -f3 /proc/"$p"/cgroup 2>/dev/null | sed 's#.*/##')"
+        [ -n "$p" ] && { c=$(ow_client_cpu); echo "Overwolf CPU:      ${c}% average since start$( [ "${c%%.*}" -ge 40 ] 2>/dev/null && echo ' (SPINNING: healthy idle is <10%; alecaframe stop)')"; }
+        ow_thinks_game_quit && echo "Overwolf state:    thinks the game QUIT while it is running -> live data is over for this run (overlay-kill misdetect; see OVERLAY_KILL_MAX)"
         reaper_alive && echo "Overlay containment: ARMED"
         echo "Profile: $CONF"; echo "  WINEPREFIX=$WINEPREFIX"; echo "  PROTONPATH=$PROTONPATH"; echo "  LAUNCHER=$(resolve_launcher)"
         echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)" ;;
@@ -845,7 +875,7 @@ case "${1:-}" in
         echo "--- events provider"; [ -f "$GEP_LOG" ] && tail -n 10 "$GEP_LOG" | cut -c1-200
         echo "--- launcher/containment"; tail -n 10 "$LOG" 2>/dev/null ;;
     profile)
-        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED REATTACH_AFTER GIVEUP_AFTER TRIM_MEMORY TRIM_ABOVE_MB TRIM_TO_MB INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
+        echo "config file: $CONF"; for v in WINEPREFIX GAME_DIR LAUNCHER_EXE GAMEID STORE PROTONPATH AF_EXTID OOPO_MODE NEUTER_REMOTE_DISABLE OVERLAY_KILL_WHEN_LOADED OVERLAY_KILL_MAX REATTACH_AFTER GIVEUP_AFTER TRIM_MEMORY TRIM_ABOVE_MB TRIM_TO_MB INJECT_MODE STEAM_APPID SLR_LAUNCH_CLIENT; do echo "$v=${!v}"; done
         echo "launcher resolves to: $(resolve_launcher)" ;;
     doctor)
         ok() { echo "  [ok]   $*"; }; bad() { echo "  [!!]   $*"; }

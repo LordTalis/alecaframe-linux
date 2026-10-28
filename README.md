@@ -131,6 +131,11 @@ If you want no memory reading at all, use [TennoScope](https://github.com/Defter
 - Large inventories: the overlay must stay alive until the inventory is captured, or Overwolf drops the game
   before the scan finishes. The tool handles this (it kills the overlay only after the data is cached), so the
   first capture after login can take up to a minute during which a brief input grab is possible.
+- The overlay is killed at most once per scanner session (`OVERLAY_KILL_MAX`, default 1). Overwolf relaunches
+  `ow-overlay.exe` after a kill, and killing it again right away makes Overwolf log the live game as *Quit*: the
+  events feed closes for the rest of the run and the Overwolf client spins at ~70% CPU, so AlecaFrame's window
+  stops responding (2026-10-27, three kills in five seconds). `alecaframe status` now shows the client's CPU and
+  flags that state; the watchdog notifies once. If one kill still trips it, set `OVERLAY_KILL_MAX="0"`.
 - Press Play soon after READY. If the scanner misses the game, the watchdog re-attaches once (about a minute
   in) and gives up after 5 minutes without data (`GIVEUP_AFTER`): overlay stopped, game left alone, desktop
   notification. It never re-injects more than once per run.
