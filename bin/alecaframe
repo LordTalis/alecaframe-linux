@@ -32,10 +32,17 @@ OVERLAY_KILL_MAX="1"           # ...at most this many times per scanner session.
                                # killing it again and again (3x in 5 s on 2026-10-27) makes Overwolf decide the GAME quit:
                                # it closes the data feed and its client spins at 70% CPU (AlecaFrame window frozen). 0 = never kill.
 REATTACH_AFTER="75"            # seconds of game uptime without the scanner before the watchdog restarts Overwolf (once)
-GIVEUP_AFTER="300"             # seconds of game uptime without captured data before the watchdog kills the overlay and stops
+GIVEUP_AFTER="900"             # seconds AFTER LOGIN (EE.log "Logged in") without captured data before the watchdog kills the
+                               # overlay and stops. Counted from login since 2026-11-05: the inventory only arrives after
+                               # login/loading screens, and a 7-minute login made the old game-start clock give up first.
 TRIM_MEMORY="1"                # 1 = keep Overwolf under its 900 MiB self-restart ("Time for a break") by reclaiming cold pages
 TRIM_ABOVE_MB="750"            # trim when the Overwolf client's resident memory is above this
 TRIM_TO_MB="550"               # ...aiming for about this
+CLIPKEEP="1"                   # 1 = run clipkeep.exe next to the game: when another program in the game's Wine session
+                               # (Overwolf) takes focus for a split second, Wine drops the game's mouse lock and Warframe
+                               # does not lock it again, so the pointer slides to the other monitor mid-mission. clipkeep
+                               # puts the game's own lock back after such a blip; Esc and Alt-Tab still free the mouse.
+CLIPKEEP_EXE="${XDG_DATA_HOME:-$HOME/.local/share}/alecaframe-linux/clipkeep.exe"   # built from tools/clipkeep.c
 INJECT_MODE="umu"              # umu = re-enter the umu-run container; steam = Valve launcher service (experimental)
 STEAM_APPID="230410"
 SLR_LAUNCH_CLIENT=""
@@ -458,6 +465,17 @@ inventory_ready() {   # true once AlecaFrame has captured the inventory this ses
     [ -n "$logs" ] || return 1                                                          # capture makes Overwolf drop
     grep -a -q 'New inventory data' $logs 2>/dev/null                                   # the game and lose the data.
 }
+RIG_EE_LOG="$PFX_USER/AppData/Local/Warframe/EE.log"
+since_login() {   # seconds since the player logged in during THIS game run (EE.log "Logged in" line), -1 before login.
+    # EE.log lines start with seconds since the game process started, so login age = game age - that offset.
+    local age off
+    age=$(game_age); [ "${age:-0}" -gt 0 ] 2>/dev/null || { echo -1; return; }
+    # an EE.log not written since the game started belongs to an earlier run
+    [ "$(stat -c %Y "$RIG_EE_LOG" 2>/dev/null || echo 0)" -ge $(( $(date +%s) - age )) ] || { echo -1; return; }
+    off=$(tr -d '\r' < "$RIG_EE_LOG" 2>/dev/null | grep -a -m1 -E '^[0-9]+\.[0-9]+ Sys \[Info\]: Logged in ' | cut -d. -f1)
+    [ -n "$off" ] || { echo -1; return; }
+    echo $(( age - off ))
+}
 
 # ---------- memory trim: the Linux stand-in for Windows' EmptyWorkingSet ----------
 # Overwolf restarts itself ("Time for a break", OverWolf.Client.BL MemoryTracker) once its private working set reaches
@@ -525,6 +543,64 @@ inject() {
     fi
 }
 
+# ---------- mouse-lock keeper (tools/clipkeep.c) ----------
+clipkeep_running() { ps -eo comm 2>/dev/null | grep -qx 'clipkeep.exe'; }
+start_clipkeep() {   # into the running container, like inject(), but WITHOUT mark_attach (it is not an Overwolf attach)
+    [ "$CLIPKEEP" = "1" ] && [ "$INJECT_MODE" = "umu" ] && [ -f "$CLIPKEEP_EXE" ] || return 0
+    clipkeep_running && return 0
+    local wlog="Z:$(printf '%s' "$LOGDIR/clipkeep.log" | tr '/' '\\')"
+    echo "$(date +%H:%M:%S) starting clipkeep (keeps the game's mouse lock through focus blips; log: $LOGDIR/clipkeep.log)" >> "$LOG"
+    setsid nohup env "${UMU_ENV[@]}" PROTON_VERB=runinprefix UMU_RUNTIME_UPDATE=0 \
+        umu-run "$CLIPKEEP_EXE" "$wlog" </dev/null >>"$LOG" 2>&1 &
+}
+stop_clipkeep() { pkill -x clipkeep.exe 2>/dev/null || true; }
+
+# ---------- Wine X11 driver registry keys (user.reg) ----------
+# Wine reads user.reg only when its wineserver starts and REWRITES the file when it exits, so the keys are checked right
+# before a launch and only while no wineserver runs for the prefix. Space-separated Name=Value pairs; "" = disabled.
+#   UseTakeFocus=N  (2026-11-07) KWin 6.7.5 mishandles Wine's WM_TAKE_FOCUS ("Globally Active") windows (KDE bug 525590,
+#                   fixed in KWin 6.7.6): X focus flips to another window for ~30 ms, Wine's server drops the game's cursor
+#                   clip on every foreground change, and the pointer slides onto the second monitor. Without WM_TAKE_FOCUS
+#                   KWin uses its normal focus path. GrabFullscreen=Y is deliberately NOT set (it would trap the mouse in
+#                   menus; the user wants Esc to free it).
+X11_DRIVER_KEYS="UseTakeFocus=N"
+prefix_wineserver_running() { pgrep -af wineserver 2>/dev/null | grep -qF -- "$WINEPREFIX"; }
+ensure_x11_driver_keys() {
+    [ -n "$X11_DRIVER_KEYS" ] && [ -f "$WINEPREFIX/user.reg" ] || return 0
+    local i; for i in $(seq 1 20); do prefix_wineserver_running || break; sleep 1; done
+    if prefix_wineserver_running; then
+        echo "[alecaframe] a wineserver is still running for $WINEPREFIX: registry keys ($X11_DRIVER_KEYS) not checked" >&2; return 0
+    fi
+    python3 - "$WINEPREFIX/user.reg" $X11_DRIVER_KEYS <<'PYEOF'
+import os, sys, time, shutil
+reg, pairs = sys.argv[1], [a.split("=", 1) for a in sys.argv[2:]]
+SECTION = "[Software\\\\Wine\\\\X11 Driver]"
+text = open(reg, encoding="utf-8", errors="surrogateescape").read()
+lines = text.split("\n")
+start = next((i for i, l in enumerate(lines) if l.startswith(SECTION + " ") or l == SECTION), None)
+if start is None:
+    while lines and lines[-1] == "": lines.pop()
+    t = time.time()
+    block = [f"{SECTION} {int(t)}", "#time=" + format(int((t + 11644473600) * 10_000_000), "x")] + [f'"{k}"="{v}"' for k, v in pairs]
+    new = "\n".join(lines + [""] + block + ["", ""])
+else:
+    end = start + 1
+    while end < len(lines) and not lines[end].startswith("["): end += 1
+    last = end == len(lines)
+    body = lines[start:end]
+    while body and body[-1] == "": body.pop()
+    kept = [l for l in body if not any(l.startswith(f'"{k}"=') for k, _ in pairs)] + [f'"{k}"="{v}"' for k, v in pairs]
+    new = "\n".join(lines[:start] + kept + (["", ""] if last else [""]) + lines[end:])
+if new != text:
+    bak = f"{reg}.bak-{time.strftime('%Y%m%d')}-x11keys"
+    if not os.path.exists(bak): shutil.copy2(reg, bak)
+    tmp = reg + ".tmp-x11keys"
+    with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f: f.write(new)
+    os.replace(tmp, reg)
+    print(f"[alecaframe] user.reg: set X11 Driver {' '.join(sys.argv[2:])} (backup {os.path.basename(bak)})")
+PYEOF
+}
+
 # ---------- overlay containment ----------
 contain_overlay_windows() {
     command -v xdotool >/dev/null || return 0
@@ -563,13 +639,18 @@ reap_dead_overlays() {
 overlay_reaper_loop() {
     # Per game run: at most ONE re-attach, then give up. Every re-attach injects Overwolf into the live game again; on
     # 2026-10-18 the second one in a session killed it (exit 0xC0000409), so never loop on it.
-    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning att stale_gep kills=0 kill_sess=0 quit_warned=0
+    local misses=0 tick=0 reattached=0 gave_up=0 age started scan_t0 scanning att stale_gep kills=0 kill_sess=0 quit_warned=0 sl cap_logged=0 ck_starts=0
     while :; do
         reap_dead_overlays
         contain_overlay_windows
         tick=$((tick+1))
         [ $((tick % 15)) -eq 0 ] && trim_overwolf
-        game_running || { reattached=0; gave_up=0; kills=0; kill_sess=0; quit_warned=0; }
+        game_running || { reattached=0; gave_up=0; kills=0; kill_sess=0; quit_warned=0; cap_logged=0; ck_starts=0; }
+        # mouse-lock keeper: start it once the game runs (at most twice per run in case it dies; it exits by itself
+        # 2 min after the game is gone)
+        if [ $((tick % 5)) -eq 0 ] && [ "$ck_starts" -lt 2 ] && game_running && ! clipkeep_running; then
+            start_clipkeep; ck_starts=$((ck_starts+1))
+        fi
         if [ $((tick % 10)) -eq 0 ] && [ "$quit_warned" -eq 0 ] && ow_thinks_game_quit; then
             # Overwolf dropped the live game (overlay kill misread as the game exiting): the feed is closed for this run
             # and its client may spin. Nothing to re-inject here (the game is fine); tell the user once and leave it.
@@ -603,6 +684,11 @@ overlay_reaper_loop() {
                 notify_fail "Overwolf loaded a games list without the Linux fix, so it could not read this game session. Overwolf was stopped so the game stays smooth. The fix is re-applied: quit Warframe and start it again with 'alecaframe warframe'."
                 gave_up=1
             elif gep_loaded && inventory_ready; then
+                if [ "$cap_logged" -eq 0 ]; then
+                    sl=$(since_login)
+                    echo "$(date +%H:%M:%S) inventory captured (game up ${age}s, $( [ "$sl" -ge 0 ] && echo "${sl}s after login" || echo "login not seen in EE.log"))" >> "$LOG"
+                    cap_logged=1
+                fi
                 # inventory captured: safe to free input by killing the overlay (the data was cached and persists)...
                 # but only OVERLAY_KILL_MAX times per scanner session. Overwolf relaunches the overlay after each kill and
                 # on 2026-10-27 the third kill in 5 s made it log the live game as "Quit" (feed closed, client spinning).
@@ -610,12 +696,14 @@ overlay_reaper_loop() {
                     [ "$kill_sess" != "$scan_t0" ] && { kills=0; kill_sess=$scan_t0; }
                     if [ "$kills" -lt "${OVERLAY_KILL_MAX:-1}" ]; then kill_overlays && kills=$((kills+1)); fi
                 fi
-            elif ! inventory_ready && [ "$scanning" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; }; then
-                # still nothing captured this long after the scanner started: stop holding the overlay (input grab, CPU)
-                # and stop trying. AlecaFrame's desktop window keeps the last cached data.
-                echo "$(date +%H:%M:%S) no inventory after ${scanning}s of scanning (game up ${age}s); giving up for this run" >> "$LOG"
+            elif ! inventory_ready && [ "$scanning" -ge "$GIVEUP_AFTER" ] && { [ "$reattached" -eq 1 ] || gep_loaded; } \
+                 && sl=$(since_login) && [ "$sl" -ge "$GIVEUP_AFTER" ]; then
+                # still nothing captured this long after LOGIN: stop holding the overlay (input grab, CPU) and stop
+                # trying. AlecaFrame keeps the last cached data. Before login (sl=-1) the overlay is always kept: on
+                # 2026-11-05 the old game-start clock killed it 97 s before a slow login, so nothing could be captured.
+                echo "$(date +%H:%M:%S) no inventory ${sl}s after login (${scanning}s of scanning, game up ${age}s); giving up for this run" >> "$LOG"
                 kill_overlays "giving up: no inventory captured"
-                notify_fail "AlecaFrame did not get live data this session. The overlay was stopped so your controls stay free; the game was left alone. Next time: 'alecaframe stop', then start with 'alecaframe warframe'."
+                notify_fail "AlecaFrame did not get your inventory in the ${GIVEUP_AFTER} s after login. The overlay was stopped so your controls stay free; the game was left alone. It retries next time you start Warframe."
                 gave_up=1
             elif gep_loaded; then
                 :   # attached but the inventory is not captured yet -> keep the overlay alive so the scan can finish
@@ -815,6 +903,7 @@ EOF
 case "${1:-}" in
     warframe)
         need_profile; shift
+        ensure_x11_driver_keys
         if [ -z "${NO_ALECA:-}" ]; then setsid "$0" wait-prepare >"$LOGDIR/autostart.log" 2>&1 & echo "[alecaframe] auto-prepare running in the background: tail -f $LOGDIR/autostart.log"; fi
         if [ "$INJECT_MODE" = "steam" ]; then exec xdg-open "steam://rungameid/$STEAM_APPID"; fi
         exec env "${UMU_ENV[@]}" umu-run "$(resolve_launcher)" "$@"
@@ -823,7 +912,7 @@ case "${1:-}" in
         echo $$ > "$REAPER_PIDFILE"; overlay_reaper_loop; exit 0 ;;
     stop)
         echo "Stopping Overwolf/AlecaFrame (the game is left alone)..."
-        stop_overlay_reaper; stop_overwolf; echo "  done" ;;
+        stop_overlay_reaper; stop_overwolf; stop_clipkeep; echo "  done" ;;
     check-data)
         overwolf_running || { echo "Overwolf is not running; start via 'alecaframe warframe' first."; exit 1; }
         if gep_loaded; then echo "Data scanner: LOADED (AlecaFrame is getting live game data)."; exit 0; fi

@@ -213,6 +213,10 @@ fi
 log "9/9 alecaframe tool + profile"
 mkdir -p "$HOME/.local/bin" "${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux"
 install -m 755 "$REPO_DIR/bin/alecaframe" "$HOME/.local/bin/alecaframe"
+# mouse-lock keeper (tools/clipkeep.c): keeps the game's mouse lock through Overwolf's split-second focus blips
+CK_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/alecaframe-linux"
+(cd "$REPO_DIR/prebuilt/clipkeep" && sha256sum -c SHA256SUMS >/dev/null) || die "prebuilt clipkeep.exe checksum mismatch"
+mkdir -p "$CK_DIR" && install -m 755 "$REPO_DIR/prebuilt/clipkeep/clipkeep.exe" "$CK_DIR/clipkeep.exe"
 PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/alecaframe-linux/profile.conf"
 if [ ! -f "$PROFILE" ]; then
     cat > "$PROFILE" <<EOF

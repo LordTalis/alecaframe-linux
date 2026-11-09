@@ -85,6 +85,13 @@ On an older build: wait a minute, then `alecaframe reattach`.
 
 ## How it works, in one paragraph
 
+Mouse slipping onto a second monitor mid-mission: Wine drops the game's cursor clip on every foreground change, and
+KWin 6.7.5 moves X focus away from Wine's WM_TAKE_FOCUS windows for ~30 ms at a time (KDE bug 525590, fixed in KWin 6.7.6).
+`alecaframe warframe` therefore writes `UseTakeFocus=N` to the prefix's `[Software\\Wine\\X11 Driver]` key before each
+launch (`X11_DRIVER_KEYS` in the tool; only while no wineserver runs), and `tools/clipkeep.c` counts the remaining blips
+(10-minute summary lines in `logs/clipkeep.log`). `GrabFullscreen=Y` is the blunt alternative: no slips, but Esc menus
+cannot free the mouse either.
+
 Warframe runs through umu-launcher + Proton inside Valve's pressure-vessel container. `alecaframe prepare`
 re-enters that container (`UMU_CONTAINER_NSENTER=1`) and starts `OverwolfLauncher.exe -launchapp <AlecaFrame>`
 so Overwolf shares the game's Wine session. Overwolf injects its overlay (needed once: its first rendered frame

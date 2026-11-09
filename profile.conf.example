@@ -10,8 +10,11 @@ NEUTER_REMOTE_DISABLE="0"                             # 1 = override Overwolf's 
 OVERLAY_KILL_WHEN_LOADED="1"                          # kill ow-overlay.exe once the scanner is attached (input-grab fix)
 OVERLAY_KILL_MAX="1"                                  # kill rounds per scanner session; more makes Overwolf think the game quit. 0 = never
 REATTACH_AFTER="75"                                   # seconds of game time without scanner before the one auto re-attach
-GIVEUP_AFTER="300"                                    # seconds of game time without data before the overlay is stopped for good
+GIVEUP_AFTER="900"                                    # seconds AFTER LOGIN without data before the overlay is stopped for good
 TRIM_MEMORY="1"                                       # keep Overwolf under its 900 MiB self-restart by reclaiming cold pages
+CLIPKEEP="1"                                          # keep the game's mouse lock through Overwolf focus blips (0 = off)
+# X11_DRIVER_KEYS="UseTakeFocus=N"                     # Wine X11 Driver registry keys ensured before launch (default in the tool;
+#                                                     # "" = off). UseTakeFocus=N works around KWin 6.7.5 focus flips, KDE bug 525590.
 # Experimental: run against Steam's own Warframe instead (launch option STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%)
 # INJECT_MODE="steam"
 # STEAM_APPID="230410"

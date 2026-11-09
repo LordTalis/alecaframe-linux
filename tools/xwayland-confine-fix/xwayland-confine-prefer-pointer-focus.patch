@@ -1,0 +1,73 @@
+--- a/hw/xwayland/xwayland-screen.c	2026-11-09 14:39:25.766909344 -0600
++++ b/hw/xwayland/xwayland-screen.c	2026-11-09 14:39:25.795358503 -0600
+@@ -362,28 +362,46 @@
+     }
+ }
+ 
++/* TRUE when the InputOutput toplevel of xwl_window covers window's geometry */
++static Bool
++xwl_window_covers_window(struct xwl_window *xwl_window, WindowPtr window)
++{
++    WindowPtr toplevel = xwl_window->toplevel;
++
++    if (toplevel->drawable.class == InputOnly)
++        return FALSE;
++
++    return window->drawable.x >= toplevel->drawable.x &&
++           window->drawable.x + window->drawable.width <=
++           toplevel->drawable.x + toplevel->drawable.width &&
++           window->drawable.y >= toplevel->drawable.y &&
++           window->drawable.y + window->drawable.height <=
++           toplevel->drawable.y + toplevel->drawable.height;
++}
++
+ static struct xwl_window *
+ find_matching_input_output_window(struct xwl_screen *xwl_screen,
++                                  struct xwl_seat *xwl_seat,
+                                   WindowPtr window)
+ {
+     struct xwl_window *xwl_window;
+ 
+-    xorg_list_for_each_entry(xwl_window, &xwl_screen->window_list, link_window) {
+-        /* When confining happens on InputOnly windows, work out the InputOutput
+-         * window that would be covered by its geometry.
+-         */
+-        if (window->drawable.x < xwl_window->toplevel->drawable.x ||
+-            window->drawable.x + window->drawable.width >
+-            xwl_window->toplevel->drawable.x + xwl_window->toplevel->drawable.width ||
+-            window->drawable.y < xwl_window->toplevel->drawable.y ||
+-            window->drawable.y + window->drawable.height >
+-            xwl_window->toplevel->drawable.y + xwl_window->toplevel->drawable.height)
+-            continue;
+-
+-        if (xwl_window->toplevel->drawable.class == InputOnly)
+-            continue;
++    /* When confining happens on InputOnly windows, work out the InputOutput
++     * window that would be covered by its geometry.
++     *
++     * Several toplevels may cover that geometry, e.g. an overlay window kept
++     * below a fullscreen game (Overwolf under Wine). The compositor only
++     * honours a pointer constraint on the surface that has pointer focus, so
++     * prefer the window the pointer is currently in when it covers the
++     * geometry; otherwise fall back to the most recently realized one.
++     */
++    if (xwl_seat->focus_window &&
++        xwl_window_covers_window(xwl_seat->focus_window, window))
++        return xwl_seat->focus_window;
+ 
+-        return xwl_window;
++    xorg_list_for_each_entry(xwl_window, &xwl_screen->window_list, link_window) {
++        if (xwl_window_covers_window(xwl_window, window))
++            return xwl_window;
+     }
+ 
+     return NULL;
+@@ -419,7 +437,7 @@
+     xwl_window = xwl_window_from_window(window);
+     if (!xwl_window && window->drawable.class == InputOnly) {
+         DebugF("Confine on InputOnly window, finding matching toplevel\n");
+-        xwl_window = find_matching_input_output_window(xwl_screen, window);
++        xwl_window = find_matching_input_output_window(xwl_screen, xwl_seat, window);
+     }
+     if (!xwl_window)
+         return;
